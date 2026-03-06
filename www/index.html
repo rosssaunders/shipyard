@@ -500,9 +500,9 @@
     connectWs();
     loadProjects();
 
-    // Auto-refresh agents every 10s
+    // Auto-refresh active view every 10s
     setInterval(() => {
-        if (activeProjectId) loadAgents(activeProjectId);
+        if (activeProjectId && activeView === 'agents') loadAgents(activeProjectId);
     }, 10000);
     </script>
 </body>
