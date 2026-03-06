@@ -268,15 +268,23 @@ async fn call_llm(model: &str, system: &str, user: &str) -> Result<String> {
 }
 
 fn parse_plan_response(response: &str) -> Result<TaskPlan> {
-    // Try to extract JSON from the response (might have markdown wrapping)
-    let json_str = if let Some(start) = response.find('{') {
-        if let Some(end) = response.rfind('}') {
-            &response[start..=end]
+    // Strip markdown code fences if present
+    let cleaned = response
+        .trim()
+        .strip_prefix("```json").unwrap_or(response)
+        .strip_prefix("```").unwrap_or(response)
+        .strip_suffix("```").unwrap_or(response)
+        .trim();
+
+    // Try to extract JSON from the response
+    let json_str = if let Some(start) = cleaned.find('{') {
+        if let Some(end) = cleaned.rfind('}') {
+            &cleaned[start..=end]
         } else {
-            response
+            cleaned
         }
     } else {
-        response
+        cleaned
     };
 
     let plan: TaskPlan = serde_json::from_str(json_str).unwrap_or_else(|_| {
