@@ -657,11 +657,21 @@ async fn run_task_pipeline(
     add_event(&state, &task_id, "agent", "🔨", "Agent finished coding", None);
     update_task_status(&state, &task_id, "gates");
 
+    // Auto-commit any uncommitted changes the agent left behind
+    let status = run_cmd(worktree, "git", &["status", "--porcelain"]);
+    if status.0 && !status.1.trim().is_empty() {
+        add_event(&state, &task_id, "system", "📝", "Auto-committing uncommitted changes...", None);
+        let _ = run_cmd(worktree, "git", &["add", "-A"]);
+        let commit_msg = format!("feat: {}", title.chars().take(72).collect::<String>());
+        let _ = run_cmd(worktree, "git", &["commit", "-m", &commit_msg]);
+    }
+
     // Check if there are any commits
-    let has_commits = run_cmd(&worktree, "git", &["log", "--oneline", "HEAD", "^main", "--"]);
+    let has_commits = run_cmd(worktree, "git", &["log", "--oneline", "HEAD", "^main", "--"]);
     if !has_commits.0 || has_commits.1.trim().is_empty() {
         add_event(&state, &task_id, "error", "⚠️", "No commits produced by agent", None);
         update_task_status(&state, &task_id, "failed");
+        learn_from_task(&state, &task_id, &title, &model).await;
         return;
     }
 
