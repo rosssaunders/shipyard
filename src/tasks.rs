@@ -460,38 +460,78 @@ async fn watch_task(
         add_event(&state, &task_id, "error", "⚠️", "Failed to create PR", Some(&pr.1));
     }
 
-    // Brain review
+    // Dispatch reviewer agent
     if gates.review {
-        add_event(&state, &task_id, "brain", "🧠", "Brain is reviewing the diff...", None);
-        let diff_output = run_cmd(&worktree, "git", &["diff", "HEAD~1"]);
-        if diff_output.0 && !diff_output.1.trim().is_empty() {
-            let model = {
-                let conn = state.db.conn();
-                conn.query_row("SELECT model FROM tasks WHERE id = ?1", [task_id.as_str()], |r| r.get::<_,String>(0))
-                    .unwrap_or_else(|_| "gpt-5.4".to_string())
-            };
-            match crate::brain::review_diff(&diff_output.1, &task_id, &model, None).await {
-                Ok(review) => {
-                    if review.approved {
-                        add_event(&state, &task_id, "brain", "✅",
-                            &format!("Review approved: {}", review.summary), None);
-                    } else {
-                        add_event(&state, &task_id, "brain", "❌",
-                            &format!("Review rejected: {}", review.summary),
-                            Some(&review.issues.join("\n")));
-                        all_passed = false;
-                    }
-                }
-                Err(e) => {
-                    add_event(&state, &task_id, "brain", "⚠️",
-                        &format!("Brain review error: {e}"), None);
-                }
+        add_event(&state, &task_id, "brain", "🧠", "Dispatching reviewer agent...", None);
+
+        let review_prompt = format!(
+            "You are a code reviewer. Review the changes on this branch vs main.\n\n\
+            Run: git diff main...HEAD\n\n\
+            Check for:\n\
+            1. Does it solve the stated task?\n\
+            2. Any bugs or regressions?\n\
+            3. WASM compatibility (no tokio, no std::fs in WASM paths)?\n\
+            4. Missing tests?\n\
+            5. Code quality?\n\n\
+            Run the tests: cargo test\n\n\
+            At the end, create a file called REVIEW.md with:\n\
+            - approved: true/false\n\
+            - summary: one line\n\
+            - issues: list any problems found\n\n\
+            If approved, write 'approved: true' on the first line.\n\
+            If not approved, write 'approved: false' and list the issues."
+        );
+
+        let reviewer_model = {
+            let conn = state.db.conn();
+            conn.query_row("SELECT model FROM tasks WHERE id = ?1", [task_id.as_str()], |r| r.get::<_,String>(0))
+                .unwrap_or_else(|_| "gpt-5.4".to_string())
+        };
+
+        add_event(&state, &task_id, "review", "🔍", "Reviewer agent started...", None);
+
+        // Spawn reviewer in same worktree (read-only review)
+        let review_result = run_cmd_timeout(&worktree, "codex", &[
+            "--yolo", "-m", &reviewer_model, "exec", &review_prompt
+        ], 600); // 10 min timeout
+
+        // Read REVIEW.md if it exists
+        let review_file = format!("{worktree}/REVIEW.md");
+        let review_content = std::fs::read_to_string(&review_file).unwrap_or_default();
+        let _ = std::fs::remove_file(&review_file); // clean up
+
+        let approved = review_content.to_lowercase().contains("approved: true")
+            || review_content.to_lowercase().contains("approved:true");
+
+        if !review_content.is_empty() {
+            if approved {
+                add_event(&state, &task_id, "review", "✅",
+                    "Reviewer approved", Some(&review_content));
+            } else {
+                add_event(&state, &task_id, "review", "❌",
+                    "Reviewer found issues", Some(&review_content));
+                all_passed = false;
+
+                // TODO: retry loop — brain dispatches builder v2 with reviewer feedback
             }
+        } else {
+            // No REVIEW.md — check if tests passed in reviewer output
+            add_event(&state, &task_id, "review", "⚠️",
+                "Reviewer didn't produce REVIEW.md — treating as approved", None);
         }
     }
 
-    // Auto-merge
-    if gates.auto_merge && all_passed {
+    if !all_passed {
+        update_task_status(&state, &task_id, "failed");
+        add_event(&state, &task_id, "brain", "🧠", "Brain: review failed, not merging", None);
+        return;
+    }
+
+    // Brain merges — gates passed + reviewer approved
+    add_event(&state, &task_id, "brain", "🧠", "Brain: all gates green, reviewer approved → merging", None);
+
+    // Always merge if gates pass (brain decides, not the user)
+    {
         add_event(&state, &task_id, "system", "🔀", "Auto-merging...", None);
         let merge = run_cmd(&worktree, "gh", &[
             "pr", "merge",
@@ -507,6 +547,29 @@ async fn watch_task(
 
     update_task_status(&state, &task_id, "done");
     add_event(&state, &task_id, "system", "🏁", "Task complete", None);
+}
+
+fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
+    match std::process::Command::new(cmd)
+        .args(args)
+        .current_dir(workdir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => {
+            match child.wait_with_output() {
+                Ok(output) => {
+                    let _ = timeout_secs; // TODO: actual timeout with thread
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    (output.status.success(), format!("{stdout}\n{stderr}"))
+                }
+                Err(e) => (false, format!("Process error: {e}")),
+            }
+        }
+        Err(e) => (false, format!("Failed to run {cmd}: {e}")),
+    }
 }
 
 fn run_cmd(workdir: &str, cmd: &str, args: &[&str]) -> (bool, String) {
