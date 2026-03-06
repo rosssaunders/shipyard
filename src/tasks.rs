@@ -234,103 +234,54 @@ pub async fn create_task(
         conn.execute(
             "INSERT INTO tasks (id, project_id, issue_number, title, status, agent_type, model, worktree_path, branch, created_at, auto_merge)
              VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![id, req.project_id, req.issue_number, req.title, agent_type, model, worktree_path, branch, now, gates.auto_merge as i32],
+            rusqlite::params![id, req.project_id, req.issue_number, req.title, agent_type, model, worktree_path, branch, now, true],
         ).unwrap();
     }
 
-    // Brain planning phase
-    add_event(&state, &id, "brain", "🧠", "Brain is analyzing the task...", None);
+    // Return task immediately, run pipeline in background
+    let task = get_task_from_db(&state, &id);
 
-    let plan = crate::brain::plan_task(
-        &owner,
-        &repo,
-        req.issue_number,
-        &req.title,
-        req.extra_instructions.as_deref(),
-        &model,
-        None, // TODO: load project-specific context
-    )
-    .await;
+    let bg_state = state.clone();
+    let bg_id = id.clone();
+    let bg_owner = owner.clone();
+    let bg_repo = repo.clone();
+    let bg_model = model.clone();
+    let bg_agent_type = agent_type.clone();
+    let bg_branch = branch.clone();
+    let bg_worktree = worktree_path.clone();
+    let bg_title = req.title.clone();
+    let bg_issue = req.issue_number;
+    let bg_extra = req.extra_instructions.clone();
+    let bg_gates = gates;
 
-    let prompt = match &plan {
-        Ok(plan) => {
-            add_event(&state, &id, "brain", "🧠",
-                &format!("Complexity: {}/5 — {}", plan.complexity, plan.assessment),
-                None);
-
-            if plan.subtasks.len() > 1 {
-                add_event(&state, &id, "brain", "🧠",
-                    &format!("Breaking into {} subtasks", plan.subtasks.len()),
-                    Some(&plan.subtasks.iter().map(|s| format!("• {}", s.title)).collect::<Vec<_>>().join("\n")));
-            }
-
-            // For now, concatenate all subtask prompts (TODO: sequential dispatch)
-            plan.subtasks.iter().map(|s| s.prompt.as_str()).collect::<Vec<_>>().join("\n\n---\n\n")
-        }
-        Err(e) => {
-            add_event(&state, &id, "brain", "⚠️",
-                &format!("Brain planning failed, using basic prompt: {e}"), None);
-            // Fallback to basic prompt
-            let mut p = if let Some(issue_num) = req.issue_number {
-                format!("Fix issue #{issue_num}: {}. Run `gh issue view {issue_num}` for full context. Implement the fix, ensure all tests pass, commit and push.", req.title)
-            } else {
-                req.title.clone()
-            };
-            if let Some(extra) = &req.extra_instructions {
-                p.push_str(&format!("\n\nAdditional instructions: {extra}"));
-            }
-            p
-        }
-    };
-
-    add_event(&state, &id, "dispatch", "🚀",
-        &format!("Dispatching to {} ({})", agent_type, model), None);
-
-    // Spawn agent
-    let pid = state
-        .agents
-        .spawn(&id, &worktree_path, &model, &prompt, &agent_type)
-        .await
-        .unwrap_or(0);
-
-    {
-        let conn = state.db.conn();
-        let _ = conn.execute("UPDATE tasks SET pid = ?1 WHERE id = ?2", rusqlite::params![pid, id]);
-    }
-
-    add_event(&state, &id, "agent", "🔨", "Agent started working...", None);
-
-    // Background watcher
-    let watcher_state = state.clone();
-    let watcher_id = id.clone();
-    let watcher_worktree = worktree_path.clone();
-    let watcher_branch = branch.clone();
     tokio::spawn(async move {
-        watch_task(
-            watcher_state,
-            watcher_id,
-            watcher_worktree,
-            watcher_branch,
-            owner,
-            repo,
-            req.issue_number,
-            gates,
-        )
-        .await;
+        run_task_pipeline(
+            bg_state, bg_id, bg_owner, bg_repo, bg_model, bg_agent_type,
+            bg_branch, bg_worktree, bg_title, bg_issue, bg_extra, bg_gates,
+        ).await;
     });
 
-    Json(Task {
-        id,
-        project_id: req.project_id,
-        issue_number: req.issue_number,
-        title: req.title,
-        status: "running".to_string(),
-        agent_type,
-        model,
-        created_at: now,
-        finished_at: None,
-        events: vec![],
-    })
+    Json(task.unwrap())
+}
+
+fn get_task_from_db(state: &AppState, id: &str) -> Option<Task> {
+    let conn = state.db.conn();
+    conn.query_row(
+        "SELECT id, project_id, issue_number, title, status, agent_type, model, created_at, finished_at FROM tasks WHERE id = ?1",
+        [id],
+        |row| Ok(Task {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            issue_number: row.get(2)?,
+            title: row.get(3)?,
+            status: row.get(4)?,
+            agent_type: row.get(5)?,
+            model: row.get(6)?,
+            created_at: row.get(7)?,
+            finished_at: row.get(8)?,
+            events: vec![],
+        }),
+    ).ok()
 }
 
 pub async fn kill_task(
@@ -345,18 +296,83 @@ pub async fn kill_task(
     Json(killed)
 }
 
-// --- Background task watcher ---
-
-async fn watch_task(
+async fn run_task_pipeline(
     state: Arc<AppState>,
-    task_id: String,
-    worktree: String,
-    branch: String,
+    id: String,
     owner: String,
     repo: String,
+    model: String,
+    agent_type: String,
+    branch: String,
+    worktree_path: String,
+    title: String,
     issue_number: Option<i64>,
+    extra_instructions: Option<String>,
     gates: QualityGates,
 ) {
+    let task_id = &id;
+    let worktree = &worktree_path;
+
+    // Brain planning phase
+    add_event(&state, task_id, "brain", "🧠", "Brain is analyzing the task...", None);
+
+    let plan = crate::brain::plan_task(
+        &owner,
+        &repo,
+        issue_number,
+        &title,
+        extra_instructions.as_deref(),
+        &model,
+        None, // TODO: load project-specific context
+    )
+    .await;
+
+    let prompt = match &plan {
+        Ok(plan) => {
+            add_event(&state, task_id, "brain", "🧠",
+                &format!("Complexity: {}/5 — {}", plan.complexity, plan.assessment),
+                None);
+
+            if plan.subtasks.len() > 1 {
+                add_event(&state, task_id, "brain", "🧠",
+                    &format!("Breaking into {} subtasks", plan.subtasks.len()),
+                    Some(&plan.subtasks.iter().map(|s| format!("• {}", s.title)).collect::<Vec<_>>().join("\n")));
+            }
+
+            plan.subtasks.iter().map(|s| s.prompt.as_str()).collect::<Vec<_>>().join("\n\n---\n\n")
+        }
+        Err(e) => {
+            add_event(&state, task_id, "brain", "⚠️",
+                &format!("Brain planning failed, using basic prompt: {e}"), None);
+            let mut p = if let Some(issue_num) = issue_number {
+                format!("Fix issue #{issue_num}: {title}. Run `gh issue view {issue_num}` for full context. Implement the fix, ensure all tests pass, commit and push.")
+            } else {
+                title.clone()
+            };
+            if let Some(extra) = &extra_instructions {
+                p.push_str(&format!("\n\nAdditional instructions: {extra}"));
+            }
+            p
+        }
+    };
+
+    add_event(&state, task_id, "dispatch", "🚀",
+        &format!("Dispatching to {} ({})", agent_type, model), None);
+
+    // Spawn agent
+    let pid = state
+        .agents
+        .spawn(task_id, worktree, &model, &prompt, &agent_type)
+        .await
+        .unwrap_or(0);
+
+    {
+        let conn = state.db.conn();
+        let _ = conn.execute("UPDATE tasks SET pid = ?1 WHERE id = ?2", rusqlite::params![pid as i64, task_id]);
+    }
+
+    add_event(&state, task_id, "agent", "🔨", "Agent started working...", None);
+
     // Poll until agent finishes (with timeout)
     let max_wait = std::time::Duration::from_secs(12 * 3600); // 12 hour max
     let start = std::time::Instant::now();
