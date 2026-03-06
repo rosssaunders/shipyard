@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0a0a0a">
+    <title>⚓ Shipyard</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>⚓</text></svg>">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        * { -webkit-tap-highlight-color: transparent; }
+        body { overscroll-behavior: none; }
+        @keyframes pulse-dot { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .pulse-dot { animation: pulse-dot 2s infinite; }
+        .status-running { color: #fbbf24; }
+        .status-done { color: #34d399; }
+        .status-failed { color: #f87171; }
+        .status-pending { color: #9ca3af; }
+        .card { background: #111; border: 1px solid #222; border-radius: 12px; }
+        .bottom-safe { padding-bottom: env(safe-area-inset-bottom, 16px); }
+    </style>
+</head>
+<body class="bg-[#0a0a0a] text-white min-h-screen flex flex-col">
+    <div id="app" class="flex-1 flex flex-col">
+        <!-- Header -->
+        <header class="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
+            <div class="flex items-center gap-2">
+                <span class="text-2xl">⚓</span>
+                <h1 class="text-lg font-bold" id="header-title">Shipyard</h1>
+            </div>
+            <div class="flex items-center gap-3">
+                <span id="connection-dot" class="w-2 h-2 rounded-full bg-red-500"></span>
+                <button onclick="showAddProject()" class="text-zinc-400 hover:text-white text-xl">+</button>
+            </div>
+        </header>
+
+        <!-- Project tabs -->
+        <div id="project-tabs" class="flex gap-1 px-3 pt-2 overflow-x-auto no-scrollbar">
+        </div>
+
+        <!-- Main content -->
+        <main id="main-content" class="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+            <div class="text-center text-zinc-500 py-20">
+                <p class="text-4xl mb-4">⚓</p>
+                <p class="text-lg">No projects yet</p>
+                <p class="text-sm mt-2">Tap + to connect a GitHub repo</p>
+            </div>
+        </main>
+
+        <!-- Chat input -->
+        <div class="border-t border-zinc-800 px-3 py-2 bottom-safe">
+            <div class="flex gap-2">
+                <input id="chat-input" type="text" placeholder="What should we build?"
+                    class="flex-1 bg-zinc-900 border border-zinc-700 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-zinc-500"
+                    onkeydown="if(event.key==='Enter')sendCommand()">
+                <button onclick="sendCommand()"
+                    class="bg-blue-600 hover:bg-blue-500 rounded-xl px-4 py-2.5 text-sm font-medium">
+                    Send
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Add Project Modal -->
+    <div id="add-project-modal" class="fixed inset-0 bg-black/80 hidden z-50 flex items-end sm:items-center justify-center">
+        <div class="card w-full max-w-md p-5 mx-3 mb-3 sm:mb-0">
+            <h2 class="text-lg font-bold mb-4">Add Project</h2>
+            <div class="space-y-3">
+                <input id="project-owner" type="text" placeholder="Owner (e.g. rosssaunders)"
+                    class="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-zinc-500">
+                <input id="project-repo" type="text" placeholder="Repository (e.g. openassay)"
+                    class="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-zinc-500">
+                <div class="flex gap-2 pt-2">
+                    <button onclick="hideAddProject()" class="flex-1 bg-zinc-800 rounded-lg py-2 text-sm">Cancel</button>
+                    <button onclick="addProject()" class="flex-1 bg-blue-600 rounded-lg py-2 text-sm font-medium">Add</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Agent Detail Modal -->
+    <div id="agent-modal" class="fixed inset-0 bg-black/80 hidden z-50 flex flex-col">
+        <div class="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
+            <h2 id="agent-modal-title" class="font-bold">Agent</h2>
+            <button onclick="hideAgentModal()" class="text-zinc-400 hover:text-white text-xl">✕</button>
+        </div>
+        <pre id="agent-logs" class="flex-1 overflow-auto px-4 py-3 text-xs text-green-400 font-mono bg-black"></pre>
+        <div class="border-t border-zinc-800 px-4 py-3 flex gap-2 bottom-safe">
+            <button onclick="killCurrentAgent()" class="bg-red-600/20 text-red-400 border border-red-800 rounded-lg px-4 py-2 text-sm">Kill</button>
+            <button onclick="refreshAgentLogs()" class="bg-zinc-800 rounded-lg px-4 py-2 text-sm flex-1">Refresh Logs</button>
+        </div>
+    </div>
+
+    <script>
+    // --- State ---
+    let projects = [];
+    let activeProjectId = null;
+    let agents = {};
+    let ws = null;
+    let currentAgentId = null;
+
+    // --- WebSocket ---
+    function connectWs() {
+        const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        ws = new WebSocket(`${proto}//${location.host}/ws`);
+        ws.onopen = () => {
+            document.getElementById('connection-dot').className = 'w-2 h-2 rounded-full bg-green-500 pulse-dot';
+        };
+        ws.onclose = () => {
+            document.getElementById('connection-dot').className = 'w-2 h-2 rounded-full bg-red-500';
+            setTimeout(connectWs, 3000);
+        };
+        ws.onmessage = (e) => {
+            const msg = JSON.parse(e.data);
+            handleWsMessage(msg);
+        };
+    }
+
+    function handleWsMessage(msg) {
+        if (msg.type === 'agent_update') {
+            loadAgents(msg.project_id);
+        }
+    }
+
+    // --- API ---
+    async function api(path, opts = {}) {
+        const res = await fetch(`/api${path}`, {
+            headers: { 'Content-Type': 'application/json' },
+            ...opts,
+            body: opts.body ? JSON.stringify(opts.body) : undefined,
+        });
+        return res.json();
+    }
+
+    // --- Projects ---
+    async function loadProjects() {
+        projects = await api('/projects');
+        renderProjectTabs();
+        if (projects.length > 0 && !activeProjectId) {
+            selectProject(projects[0].id);
+        }
+        if (projects.length === 0) {
+            renderEmpty();
+        }
+    }
+
+    function renderProjectTabs() {
+        const tabs = document.getElementById('project-tabs');
+        tabs.innerHTML = projects.map(p => `
+            <button onclick="selectProject('${p.id}')"
+                class="px-3 py-1.5 rounded-lg text-xs font-medium whitespace-nowrap transition
+                    ${p.id === activeProjectId ? 'bg-blue-600 text-white' : 'bg-zinc-800 text-zinc-400 hover:text-white'}">
+                ${p.repo}
+            </button>
+        `).join('');
+    }
+
+    async function selectProject(id) {
+        activeProjectId = id;
+        renderProjectTabs();
+        await loadAgents(id);
+    }
+
+    function showAddProject() { document.getElementById('add-project-modal').classList.remove('hidden'); }
+    function hideAddProject() { document.getElementById('add-project-modal').classList.add('hidden'); }
+
+    async function addProject() {
+        const owner = document.getElementById('project-owner').value.trim();
+        const repo = document.getElementById('project-repo').value.trim();
+        if (!owner || !repo) return;
+        await api('/projects', { method: 'POST', body: { owner, repo } });
+        hideAddProject();
+        await loadProjects();
+    }
+
+    // --- Agents ---
+    async function loadAgents(projectId) {
+        const agentList = await api(`/projects/${projectId}/agents`);
+        agents[projectId] = agentList;
+        renderAgents();
+    }
+
+    function renderAgents() {
+        const main = document.getElementById('main-content');
+        const projectAgents = agents[activeProjectId] || [];
+
+        if (projectAgents.length === 0) {
+            main.innerHTML = `
+                <div class="text-center text-zinc-500 py-12">
+                    <p class="text-2xl mb-3">🔨</p>
+                    <p>No agents running</p>
+                    <p class="text-sm mt-1">Use the chat to start work</p>
+                </div>`;
+            return;
+        }
+
+        main.innerHTML = projectAgents.map(a => `
+            <div class="card p-4 active:bg-zinc-800 cursor-pointer" onclick="showAgent('${a.id}')">
+                <div class="flex items-center justify-between mb-2">
+                    <div class="flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full ${statusColor(a.status)} ${a.status === 'running' ? 'pulse-dot' : ''}"></span>
+                        <span class="text-sm font-medium">${a.issue_number ? '#' + a.issue_number : a.id.slice(0, 8)}</span>
+                    </div>
+                    <span class="text-xs text-zinc-500">${a.model}</span>
+                </div>
+                <p class="text-xs text-zinc-400 line-clamp-2">${escHtml(a.prompt.slice(0, 120))}</p>
+                <div class="flex items-center justify-between mt-2">
+                    <span class="text-xs status-${a.status}">${a.status}</span>
+                    <span class="text-xs text-zinc-600">${timeAgo(a.created_at)}</span>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function renderEmpty() {
+        document.getElementById('main-content').innerHTML = `
+            <div class="text-center text-zinc-500 py-20">
+                <p class="text-4xl mb-4">⚓</p>
+                <p class="text-lg">No projects yet</p>
+                <p class="text-sm mt-2">Tap + to connect a GitHub repo</p>
+            </div>`;
+    }
+
+    // --- Agent Detail ---
+    async function showAgent(id) {
+        currentAgentId = id;
+        document.getElementById('agent-modal').classList.remove('hidden');
+        document.getElementById('agent-modal-title').textContent = `Agent ${id.slice(0, 8)}`;
+        await refreshAgentLogs();
+    }
+
+    function hideAgentModal() {
+        document.getElementById('agent-modal').classList.add('hidden');
+        currentAgentId = null;
+    }
+
+    async function refreshAgentLogs() {
+        if (!currentAgentId) return;
+        const res = await fetch(`/api/agents/${currentAgentId}/logs`);
+        const logs = await res.text();
+        const el = document.getElementById('agent-logs');
+        el.textContent = logs || '(waiting for output...)';
+        el.scrollTop = el.scrollHeight;
+    }
+
+    async function killCurrentAgent() {
+        if (!currentAgentId) return;
+        if (!confirm('Kill this agent?')) return;
+        await api(`/agents/${currentAgentId}/kill`, { method: 'POST' });
+        hideAgentModal();
+        loadAgents(activeProjectId);
+    }
+
+    // --- Chat ---
+    async function sendCommand() {
+        const input = document.getElementById('chat-input');
+        const text = input.value.trim();
+        if (!text || !activeProjectId) return;
+        input.value = '';
+
+        // For now, spawn an agent with the text as prompt
+        await api('/agents/spawn', {
+            method: 'POST',
+            body: { project_id: activeProjectId, prompt: text },
+        });
+        await loadAgents(activeProjectId);
+    }
+
+    // --- Helpers ---
+    function statusColor(s) {
+        return { running: 'bg-yellow-400', done: 'bg-green-400', failed: 'bg-red-400', killed: 'bg-red-400', pending: 'bg-zinc-400' }[s] || 'bg-zinc-400';
+    }
+
+    function escHtml(s) {
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function timeAgo(iso) {
+        const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+        if (s < 60) return `${s}s ago`;
+        if (s < 3600) return `${Math.floor(s/60)}m ago`;
+        if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+        return `${Math.floor(s/86400)}d ago`;
+    }
+
+    // --- Init ---
+    connectWs();
+    loadProjects();
+
+    // Auto-refresh agents every 10s
+    setInterval(() => {
+        if (activeProjectId) loadAgents(activeProjectId);
+    }, 10000);
+    </script>
+</body>
+</html>

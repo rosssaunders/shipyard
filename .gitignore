@@ -1,0 +1,30 @@
+# Rust
+/target
+Cargo.lock
+
+# Node (PWA frontend)
+node_modules/
+dist/
+
+# Data
+*.db
+*.sqlite
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Env
+.env
+.env.local
+
+
+# Added by cargo
+#
+# already existing elements were commented out
+
+#/target
