@@ -51,6 +51,7 @@ impl Database {
                 icon TEXT NOT NULL DEFAULT '📝',
                 message TEXT NOT NULL,
                 detail TEXT,
+                resolved TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 

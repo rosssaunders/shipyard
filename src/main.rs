@@ -33,13 +33,18 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let api = Router::new()
+        // New intent-driven API
+        .route("/api/intent", post(tasks::submit_intent))
+        .route("/api/feed", get(tasks::get_feed))
+        .route("/api/attention", get(tasks::get_attention))
+        .route("/api/attention/:id", post(tasks::resolve_attention))
         // Projects
         .route("/api/projects", get(projects::list_projects))
         .route("/api/projects", post(projects::add_project))
         .route("/api/projects/:id", get(projects::get_project))
         .route("/api/projects/:id/issues", get(projects::list_issues))
         .route("/api/projects/:id/agents", get(agents::list_agents))
-        // Tasks (new task-oriented API)
+        // Tasks
         .route("/api/projects/:id/tasks", get(tasks::list_tasks))
         .route("/api/tasks", post(tasks::create_task))
         .route("/api/tasks/:id", get(tasks::get_task))
@@ -49,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/agents/:id", get(agents::get_agent))
         .route("/api/agents/:id/kill", post(agents::kill_agent))
         .route("/api/agents/:id/logs", get(agents::get_agent_logs))
-        // WebSocket for real-time updates
+        // WebSocket
         .route("/ws", get(ws::ws_handler))
         .with_state(state.clone());
 

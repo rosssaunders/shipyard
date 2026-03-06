@@ -8,6 +8,184 @@ use std::sync::Arc;
 use crate::AppState;
 use crate::agents::QualityGates;
 
+// --- Intent-driven API ---
+
+#[derive(Deserialize)]
+pub struct IntentRequest {
+    pub text: String,
+    pub project_id: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct FeedEvent {
+    pub id: String,
+    pub icon: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub task_status: Option<String>,
+    pub repo: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Serialize)]
+pub struct AttentionItem {
+    pub id: String,
+    pub icon: String,
+    pub message: String,
+    pub task_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct ResolveRequest {
+    pub action: String, // "approve" or "reject"
+}
+
+/// POST /api/intent — "I want X", brain figures out the rest
+pub async fn submit_intent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IntentRequest>,
+) -> Json<serde_json::Value> {
+    // Find the project (use provided or first available)
+    let project = {
+        let conn = state.db.conn();
+        if let Some(pid) = &req.project_id {
+            conn.query_row(
+                "SELECT id, owner, repo FROM projects WHERE id = ?1",
+                [pid.as_str()],
+                |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?)),
+            ).ok()
+        } else {
+            conn.query_row(
+                "SELECT id, owner, repo FROM projects ORDER BY created_at LIMIT 1",
+                [],
+                |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?)),
+            ).ok()
+        }
+    };
+
+    let Some((project_id, owner, repo)) = project else {
+        return Json(serde_json::json!({"error": "No project configured"}));
+    };
+
+    // Brain interprets the intent → creates a task
+    let id = uuid::Uuid::new_v4().to_string();
+    let model = "gpt-5.4".to_string();
+    let agent_type = "codex".to_string();
+    let now = chrono::Utc::now().to_rfc3339();
+    let branch = format!("shipyard/{}", &id[..8]);
+    let worktree_path = format!("/tmp/shipyard/{}/{}", repo, &id[..8]);
+
+    // Create worktree
+    let repo_path = format!(
+        "{}/code/{}/{}",
+        std::env::var("HOME").unwrap_or_default(), owner, repo
+    );
+    let _ = std::fs::create_dir_all(&worktree_path);
+    let default_branch = {
+        let conn = state.db.conn();
+        conn.query_row("SELECT default_branch FROM projects WHERE id = ?1", [&project_id], |r| r.get::<_,String>(0))
+            .unwrap_or_else(|_| "main".to_string())
+    };
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "add", "-b", &branch, &worktree_path, &default_branch])
+        .current_dir(&repo_path)
+        .output();
+
+    // Insert task with the raw intent as title
+    {
+        let conn = state.db.conn();
+        conn.execute(
+            "INSERT INTO tasks (id, project_id, issue_number, title, status, agent_type, model, worktree_path, branch, created_at, auto_merge)
+             VALUES (?1, ?2, NULL, ?3, 'running', ?4, ?5, ?6, ?7, ?8, 1)",
+            rusqlite::params![id, project_id, req.text, agent_type, model, worktree_path, branch, now],
+        ).unwrap();
+    }
+
+    add_event(&state, &id, "brain", "🧠", &format!("Intent received: {}", req.text), None);
+
+    // Run pipeline in background
+    let bg_state = state.clone();
+    let bg_id = id.clone();
+    let bg_text = req.text.clone();
+    tokio::spawn(async move {
+        run_task_pipeline(
+            bg_state, bg_id, owner, repo, model, agent_type,
+            branch, worktree_path, bg_text, None, None,
+            QualityGates { tests: true, clippy: true, review: true, auto_merge: true },
+        ).await;
+    });
+
+    Json(serde_json::json!({"ok": true, "task_id": id}))
+}
+
+/// GET /api/feed — timeline of everything happening
+pub async fn get_feed(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<FeedEvent>> {
+    let conn = state.db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.icon, e.message, e.detail, e.created_at, t.status, p.repo
+         FROM task_events e
+         JOIN tasks t ON t.id = e.task_id
+         LEFT JOIN projects p ON p.id = t.project_id
+         ORDER BY e.id DESC
+         LIMIT 100"
+    ).unwrap();
+
+    let events: Vec<FeedEvent> = stmt.query_map([], |row| {
+        Ok(FeedEvent {
+            id: row.get::<_, i64>(0)?.to_string(),
+            icon: row.get(1)?,
+            message: row.get(2)?,
+            detail: row.get(3)?,
+            created_at: row.get(4)?,
+            task_status: row.get(5)?,
+            repo: row.get(6)?,
+        })
+    }).unwrap().filter_map(|r| r.ok()).collect();
+
+    Json(events)
+}
+
+/// GET /api/attention — things that need human decision
+pub async fn get_attention(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<AttentionItem>> {
+    let conn = state.db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.icon, e.message, e.task_id
+         FROM task_events e
+         JOIN tasks t ON t.id = e.task_id
+         WHERE e.kind = 'attention' AND e.resolved IS NULL
+         ORDER BY e.id DESC"
+    ).unwrap();
+
+    let items: Vec<AttentionItem> = stmt.query_map([], |row| {
+        Ok(AttentionItem {
+            id: row.get::<_, i64>(0)?.to_string(),
+            icon: row.get(1)?,
+            message: row.get(2)?,
+            task_id: row.get(3)?,
+        })
+    }).unwrap().filter_map(|r| r.ok()).collect();
+
+    Json(items)
+}
+
+/// POST /api/attention/:id — resolve an attention item
+pub async fn resolve_attention(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ResolveRequest>,
+) -> Json<bool> {
+    let conn = state.db.conn();
+    let _ = conn.execute(
+        "UPDATE task_events SET resolved = ?1 WHERE id = ?2",
+        rusqlite::params![req.action, id],
+    );
+    Json(true)
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct Task {
     pub id: String,
