@@ -497,8 +497,10 @@ function renderBacklog() {
     }).join('');
     return `
       <div class="issue-card">
-        <span class="issue-num">#${issue.number}</span>
-        <div class="issue-body">
+        <a href="https://github.com/${projects[0].owner}/${projects[0].repo}/issues/${issue.number}"
+           target="_blank" rel="noopener" class="issue-num" style="color:var(--dimmed);text-decoration:none;"
+           onclick="event.stopPropagation();">#${issue.number}</a>
+        <div class="issue-body" onclick="window.open('https://github.com/${projects[0].owner}/${projects[0].repo}/issues/${issue.number}', '_blank')" style="cursor:pointer;">
           <div class="issue-title">${escHtml(issue.title)}</div>
           <div class="issue-labels">${labels}</div>
         </div>
