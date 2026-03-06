@@ -955,6 +955,29 @@ pub fn run_cmd_timeout_pub(workdir: &str, cmd: &str, args: &[&str], timeout_secs
 }
 
 fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
+    run_cmd_timeout_sync(workdir, cmd, args, timeout_secs)
+}
+
+/// Non-blocking version with actual timeout
+pub async fn run_cmd_timeout_async(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
+    let workdir = workdir.to_string();
+    let cmd = cmd.to_string();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let result = tokio::task::spawn_blocking(move || {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_cmd_timeout_sync(&workdir, &cmd, &arg_refs, timeout_secs)
+    });
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs + 10), // grace period
+        result,
+    ).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => (false, format!("spawn_blocking failed: {e}")),
+        Err(_) => (false, format!("Command timed out after {timeout_secs}s")),
+    }
+}
+
+fn run_cmd_timeout_sync(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
     match std::process::Command::new(cmd)
         .args(args)
         .current_dir(workdir)
@@ -962,15 +985,29 @@ fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -
         .stderr(std::process::Stdio::piped())
         .spawn()
     {
-        Ok(child) => {
-            match child.wait_with_output() {
-                Ok(output) => {
-                    let _ = timeout_secs; // TODO: actual timeout with thread
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    (output.status.success(), format!("{stdout}\n{stderr}"))
+        Ok(mut child) => {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        let output = child.wait_with_output().unwrap_or_else(|_| std::process::Output {
+                            status,
+                            stdout: Vec::new(),
+                            stderr: Vec::new(),
+                        });
+                        let stdout = String::from_utf8_lossy(&output.stdout);
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        return (output.status.success(), format!("{stdout}\n{stderr}"));
+                    }
+                    Ok(None) => {
+                        if std::time::Instant::now() > deadline {
+                            let _ = child.kill();
+                            return (false, format!("Command timed out after {timeout_secs}s"));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    Err(e) => return (false, format!("Process error: {e}")),
                 }
-                Err(e) => (false, format!("Process error: {e}")),
             }
         }
         Err(e) => (false, format!("Failed to run {cmd}: {e}")),
@@ -978,6 +1015,23 @@ fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -
 }
 
 pub fn run_cmd(workdir: &str, cmd: &str, args: &[&str]) -> (bool, String) {
+    run_cmd_sync(workdir, cmd, args)
+}
+
+/// Non-blocking version — use from async contexts to avoid starving the tokio runtime
+pub async fn run_cmd_async(workdir: &str, cmd: &str, args: &[&str]) -> (bool, String) {
+    let workdir = workdir.to_string();
+    let cmd = cmd.to_string();
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        run_cmd_sync(&workdir, &cmd, &arg_refs)
+    })
+    .await
+    .unwrap_or_else(|e| (false, format!("spawn_blocking failed: {e}")))
+}
+
+fn run_cmd_sync(workdir: &str, cmd: &str, args: &[&str]) -> (bool, String) {
     match std::process::Command::new(cmd)
         .args(args)
         .current_dir(workdir)

@@ -2,10 +2,13 @@
 //!
 //! The CTO layer. Oversees all tasks, steps in on failures,
 //! patches problems, learns from outcomes.
+//!
+//! All external commands run via spawn_blocking to avoid starving
+//! the tokio runtime (which would hang the HTTP server).
 
 use std::sync::Arc;
 use crate::AppState;
-use crate::tasks::{add_event, update_task_status, run_cmd};
+use crate::tasks::{add_event, run_cmd_async, run_cmd_timeout_async};
 
 /// Run quality gates from project skills (not hardcoded)
 pub async fn run_skill_gates(
@@ -25,7 +28,7 @@ pub async fn run_skill_gates(
         if parts.is_empty() { continue; }
 
         let (cmd, args) = (parts[0], &parts[1..]);
-        let result = run_cmd(worktree, cmd, args);
+        let result = run_cmd_async(worktree, cmd, args).await;
 
         if result.0 {
             add_event(state, task_id, "gate", "✅", &format!("{} passed", gate.name), None);
@@ -77,19 +80,19 @@ pub async fn attempt_fix(
         Commit your fix with message: fix: resolve gate failures"
     );
 
-    // Spawn fixer agent
-    let fix_result = crate::tasks::run_cmd_timeout_pub(
+    // Spawn fixer agent (10 min timeout, non-blocking)
+    let fix_result = run_cmd_timeout_async(
         worktree, "codex",
         &["--yolo", "-m", model, "exec", &fix_prompt],
-        600, // 10 min for fixes
-    );
+        600,
+    ).await;
 
     // Auto-commit if fixer left uncommitted changes
-    let status = run_cmd(worktree, "git", &["status", "--porcelain"]);
+    let status = run_cmd_async(worktree, "git", &["status", "--porcelain"]).await;
     if status.0 && !status.1.trim().is_empty() {
-        let _ = run_cmd(worktree, "git", &["add", "-A"]);
-        let _ = run_cmd(worktree, "git", &["commit", "-m", 
-            &format!("fix: resolve gate failures (attempt {})", attempt)]);
+        let _ = run_cmd_async(worktree, "git", &["add", "-A"]).await;
+        let _ = run_cmd_async(worktree, "git", &["commit", "-m", 
+            &format!("fix: resolve gate failures (attempt {})", attempt)]).await;
     }
 
     if fix_result.0 {
@@ -126,10 +129,6 @@ fn load_project_skills(state: &Arc<AppState>, task_id: &str) -> String {
 }
 
 /// Parse quality gates from skills markdown
-/// Looks for a section like:
-/// ## Quality Gates
-/// - cargo test --release
-/// - cargo clippy --all-targets -- -D warnings
 fn parse_gates_from_skills(skills: &str) -> Vec<Gate> {
     let mut gates = Vec::new();
     let mut in_gates_section = false;
@@ -142,12 +141,11 @@ fn parse_gates_from_skills(skills: &str) -> Vec<Gate> {
         }
         if in_gates_section {
             if trimmed.starts_with("## ") || trimmed.starts_with("# ") {
-                break; // Next section
+                break;
             }
             if let Some(cmd) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
                 let cmd = cmd.trim();
                 if !cmd.is_empty() {
-                    // Use the command itself as the name, shortened
                     let name = if cmd.len() > 40 {
                         format!("{}...", &cmd[..37])
                     } else {
@@ -159,7 +157,6 @@ fn parse_gates_from_skills(skills: &str) -> Vec<Gate> {
         }
     }
 
-    // Fallback: if no gates in skills, use defaults
     if gates.is_empty() {
         gates.push(Gate { name: "Tests".into(), command: "cargo test".into() });
         gates.push(Gate { name: "Clippy".into(), command: "cargo clippy --all-targets -- -D warnings".into() });
