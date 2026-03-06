@@ -767,6 +767,8 @@ async fn run_task_pipeline(
     if !all_passed {
         update_task_status(&state, &task_id, "failed");
         add_event(&state, &task_id, "brain", "🧠", "Brain: review failed, not merging", None);
+        // Still learn from failures — they're the most valuable lessons
+        learn_from_task(&state, &task_id, &title, &model).await;
         return;
     }
 
@@ -788,8 +790,108 @@ async fn run_task_pipeline(
         }
     }
 
+    // Brain learns from this task
+    learn_from_task(&state, &task_id, &title, &model).await;
+
     update_task_status(&state, &task_id, "done");
     add_event(&state, &task_id, "system", "🏁", "Task complete", None);
+}
+
+/// Simple diff summary — show what lines were added/removed
+fn diff_summary(old: &str, new: &str) -> String {
+    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
+    let new_lines: std::collections::HashSet<&str> = new.lines().collect();
+    
+    let added: Vec<&&str> = new_lines.difference(&old_lines).take(10).collect();
+    let removed: Vec<&&str> = old_lines.difference(&new_lines).take(10).collect();
+    
+    let mut summary = String::new();
+    if !added.is_empty() {
+        summary.push_str("Added:\n");
+        for line in &added {
+            summary.push_str(&format!("+ {}\n", line));
+        }
+    }
+    if !removed.is_empty() {
+        summary.push_str("Removed:\n");
+        for line in &removed {
+            summary.push_str(&format!("- {}\n", line));
+        }
+    }
+    if summary.is_empty() { "Minor reformatting".to_string() } else { summary }
+}
+
+/// Brain reviews what was learned from a task and updates project skills
+async fn learn_from_task(state: &Arc<AppState>, task_id: &str, title: &str, model: &str) {
+    add_event(state, task_id, "brain", "🧠", "Brain: reviewing what was learned...", None);
+
+    let events_summary = {
+        let conn = state.db.conn();
+        let mut stmt = conn.prepare(
+            "SELECT icon, message, detail FROM task_events WHERE task_id = ?1 ORDER BY id"
+        ).unwrap();
+        let events: Vec<String> = stmt.query_map([task_id], |row| {
+            let icon: String = row.get(0)?;
+            let msg: String = row.get(1)?;
+            let detail: Option<String> = row.get(2)?;
+            Ok(if let Some(d) = detail {
+                format!("{icon} {msg}\n  Detail: {}", d.chars().take(500).collect::<String>())
+            } else {
+                format!("{icon} {msg}")
+            })
+        }).unwrap().filter_map(|r| r.ok()).collect();
+        events.join("\n")
+    };
+
+    let current_skills = {
+        let conn = state.db.conn();
+        conn.query_row(
+            "SELECT p.skills FROM projects p JOIN tasks t ON t.project_id = p.id WHERE t.id = ?1",
+            [task_id],
+            |r| r.get::<_, String>(0),
+        ).unwrap_or_default()
+    };
+
+    let learn_prompt = format!(
+        "A coding agent just completed a task (it may have succeeded or failed). \
+        Review the event timeline and update the project skills document with anything learned.\n\n\
+        ## Task: {title}\n\n\
+        ## Events Timeline\n{events_summary}\n\n\
+        ## Current Skills Document\n{current_skills}\n\n\
+        Rules:\n\
+        - ADD new gotchas, patterns, or learnings discovered during this task\n\
+        - Failures are especially valuable — if something went wrong, document WHY and HOW to avoid it\n\
+        - KEEP everything already in the skills doc that's still relevant\n\
+        - REMOVE anything proven wrong by this task\n\
+        - If nothing new was learned, return the skills document UNCHANGED\n\
+        - Be specific: \"use thread_local! not tokio::task_local! because WASM is single-threaded\"\n\
+        - Keep it under 2000 words\n\n\
+        Return ONLY the updated skills document (raw markdown, no code fences)."
+    );
+
+    match crate::brain::call_llm_pub(model,
+        "You maintain a project knowledge document for coding agents. Output raw markdown only, no wrapping.",
+        &learn_prompt).await
+    {
+        Ok(updated_skills) => {
+            let changed = updated_skills.trim() != current_skills.trim();
+            if changed && !updated_skills.trim().is_empty() {
+                let conn = state.db.conn();
+                let _ = conn.execute(
+                    "UPDATE projects SET skills = ?1 WHERE id = (SELECT project_id FROM tasks WHERE id = ?2)",
+                    rusqlite::params![updated_skills.trim(), task_id],
+                );
+                add_event(state, task_id, "brain", "📚", "Skills updated with new learnings",
+                    Some(&diff_summary(&current_skills, &updated_skills)));
+            } else {
+                add_event(state, task_id, "brain", "📚", "No new learnings to add", None);
+            }
+        }
+        Err(e) => {
+            add_event(state, task_id, "brain", "⚠️",
+                &format!("Skills update failed: {e}"), None);
+        }
+    }
 }
 
 fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
