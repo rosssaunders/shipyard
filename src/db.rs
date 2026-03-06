@@ -25,7 +25,8 @@ impl Database {
                 repo TEXT NOT NULL,
                 default_branch TEXT NOT NULL DEFAULT 'main',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                config TEXT NOT NULL DEFAULT '{}'
+                config TEXT NOT NULL DEFAULT '{}',
+                skills TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS tasks (

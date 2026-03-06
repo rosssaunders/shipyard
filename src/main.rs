@@ -43,6 +43,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/projects", post(projects::add_project))
         .route("/api/projects/:id", get(projects::get_project))
         .route("/api/projects/:id/issues", get(projects::list_issues))
+        .route("/api/projects/:id/skills", get(projects::get_skills))
+        .route("/api/projects/:id/skills", post(projects::update_skills))
+        .route("/api/projects/:id/skills/generate", post(projects::generate_skills))
         .route("/api/projects/:id/agents", get(agents::list_agents))
         // Tasks
         .route("/api/projects/:id/tasks", get(tasks::list_tasks))

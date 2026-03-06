@@ -501,6 +501,21 @@ async fn run_task_pipeline(
     // Brain planning phase
     add_event(&state, task_id, "brain", "🧠", "Brain is analyzing the task...", None);
 
+    // Load project skills for context
+    let project_skills = {
+        let conn = state.db.conn();
+        conn.query_row(
+            "SELECT skills FROM projects p JOIN tasks t ON t.project_id = p.id WHERE t.id = ?1",
+            [task_id],
+            |r| r.get::<_, String>(0),
+        ).unwrap_or_default()
+    };
+    let skills_context = if project_skills.is_empty() {
+        None
+    } else {
+        Some(format!("## Project Knowledge (Skills)\n{project_skills}"))
+    };
+
     let plan = crate::brain::plan_task(
         &owner,
         &repo,
@@ -508,7 +523,7 @@ async fn run_task_pipeline(
         &title,
         extra_instructions.as_deref(),
         &model,
-        None, // TODO: load project-specific context
+        skills_context.as_deref(),
     )
     .await;
 

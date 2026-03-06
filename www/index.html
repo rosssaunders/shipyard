@@ -232,6 +232,7 @@ header .badge {
   <button onclick="switchTab('backlog', this)">
     Backlog <span id="backlog-count" class="count hidden">0</span>
   </button>
+  <button onclick="switchTab('skills', this)">Skills</button>
   <button onclick="switchTab('attention', this)">
     Needs You <span id="attention-count" class="count hidden">0</span>
   </button>
@@ -239,6 +240,16 @@ header .badge {
 
 <div id="feed-view" class="feed"></div>
 <div id="backlog-view" class="feed hidden"></div>
+<div id="skills-view" class="feed hidden">
+  <div style="padding: 16px 20px;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+      <span style="font-size: 14px; color: var(--text2);">Project knowledge injected into every agent prompt</span>
+      <button onclick="generateSkills()" style="background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 6px 14px; color: var(--text); font-size: 13px; cursor: pointer;">🧠 Auto-generate</button>
+    </div>
+    <textarea id="skills-editor" style="width: 100%; min-height: 400px; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px; color: var(--text); font-family: 'SF Mono', monospace; font-size: 13px; line-height: 1.5; resize: vertical; outline: none;" placeholder="# Project Skills&#10;&#10;## Build&#10;- cargo test --release&#10;&#10;## Gotchas&#10;- WASM: use thread_local! not tokio::task_local!"></textarea>
+    <button onclick="saveSkills()" style="margin-top: 8px; background: var(--accent); border: none; border-radius: 8px; padding: 10px 20px; color: white; font-weight: 600; font-size: 14px; cursor: pointer; width: 100%;">Save</button>
+  </div>
+</div>
 <div id="attention-view" class="feed hidden"></div>
 
 <script>
@@ -467,6 +478,47 @@ function escAttr(s) {
   return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
 }
 
+// --- Skills ---
+async function loadSkills() {
+  if (!projects.length) return;
+  try {
+    const res = await fetch(`${API}/api/projects/${projects[0].id}/skills`);
+    const data = await res.json();
+    document.getElementById('skills-editor').value = data.skills || '';
+  } catch (e) {}
+}
+
+async function saveSkills() {
+  if (!projects.length) return;
+  const skills = document.getElementById('skills-editor').value;
+  await fetch(`${API}/api/projects/${projects[0].id}/skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ skills }),
+  });
+  alert('Skills saved ✓');
+}
+
+async function generateSkills() {
+  if (!projects.length) return;
+  const btn = event.target;
+  btn.textContent = '🧠 Generating...';
+  btn.disabled = true;
+  try {
+    const res = await fetch(`${API}/api/projects/${projects[0].id}/skills/generate`, { method: 'POST' });
+    const data = await res.json();
+    if (data.skills) {
+      document.getElementById('skills-editor').value = data.skills;
+    } else {
+      alert(data.error || 'Failed to generate');
+    }
+  } catch (e) {
+    alert('Generation failed');
+  }
+  btn.textContent = '🧠 Auto-generate';
+  btn.disabled = false;
+}
+
 // --- Tabs ---
 function switchTab(tab, btn) {
   activeTab = tab;
@@ -474,9 +526,11 @@ function switchTab(tab, btn) {
   btn.classList.add('active');
   document.getElementById('feed-view').classList.toggle('hidden', tab !== 'feed');
   document.getElementById('backlog-view').classList.toggle('hidden', tab !== 'backlog');
+  document.getElementById('skills-view').classList.toggle('hidden', tab !== 'skills');
   document.getElementById('attention-view').classList.toggle('hidden', tab !== 'attention');
   if (tab === 'attention') loadAttention();
   if (tab === 'backlog') loadBacklog();
+  if (tab === 'skills') loadSkills();
   if (tab === 'feed') loadFeed();
 }
 

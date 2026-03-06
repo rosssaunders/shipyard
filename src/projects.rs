@@ -97,6 +97,106 @@ pub async fn get_project(
     Json(project)
 }
 
+// --- Skills ---
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateSkillsRequest {
+    pub skills: String,
+}
+
+pub async fn get_skills(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let conn = state.db.conn();
+    let skills: String = conn
+        .query_row("SELECT skills FROM projects WHERE id = ?1", [&id], |r| r.get(0))
+        .unwrap_or_default();
+    Json(serde_json::json!({"skills": skills}))
+}
+
+pub async fn update_skills(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateSkillsRequest>,
+) -> Json<bool> {
+    let conn = state.db.conn();
+    let _ = conn.execute(
+        "UPDATE projects SET skills = ?1 WHERE id = ?2",
+        rusqlite::params![req.skills, id],
+    );
+    Json(true)
+}
+
+/// Auto-generate skills by reading the repo's AGENTS.md + key files
+pub async fn generate_skills(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let (owner, repo) = {
+        let conn = state.db.conn();
+        match conn.query_row(
+            "SELECT owner, repo FROM projects WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ) {
+            Ok(r) => r,
+            Err(_) => return Json(serde_json::json!({"error": "project not found"})),
+        }
+    };
+
+    let repo_path = format!(
+        "{}/code/{}/{}",
+        std::env::var("HOME").unwrap_or_default(), owner, repo
+    );
+
+    // Read AGENTS.md if it exists
+    let agents_md = std::fs::read_to_string(format!("{repo_path}/AGENTS.md")).unwrap_or_default();
+    // Read Cargo.toml for project info
+    let cargo_toml = std::fs::read_to_string(format!("{repo_path}/Cargo.toml")).unwrap_or_default();
+    // Read .github/workflows for CI info
+    let ci_files: Vec<String> = std::fs::read_dir(format!("{repo_path}/.github/workflows"))
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .collect();
+
+    // Ask the brain to synthesize skills
+    let prompt = format!(
+        "Generate a project skills/knowledge document for coding agents working on {owner}/{repo}.\n\n\
+        Based on these files, create a concise markdown document covering:\n\
+        1. Build commands and targets (including WASM if applicable)\n\
+        2. Test commands\n\
+        3. Key architecture (important files, modules, patterns)\n\
+        4. Common gotchas and pitfalls\n\
+        5. Commit conventions\n\
+        6. CI requirements\n\n\
+        ## AGENTS.md\n{agents_md}\n\n\
+        ## Cargo.toml (first 50 lines)\n{cargo_first}\n\n\
+        ## CI workflows\n{ci_info}\n\n\
+        Keep it under 2000 words. Be specific and actionable.",
+        cargo_first = cargo_toml.lines().take(50).collect::<Vec<_>>().join("\n"),
+        ci_info = ci_files.iter().take(2).map(|f| f.lines().take(30).collect::<Vec<_>>().join("\n")).collect::<Vec<_>>().join("\n---\n"),
+    );
+
+    match crate::brain::call_llm_pub("gpt-5.4", 
+        "You generate concise project knowledge documents for coding agents. Output raw markdown only, no wrapping.",
+        &prompt).await 
+    {
+        Ok(skills) => {
+            // Save to DB
+            let conn = state.db.conn();
+            let _ = conn.execute(
+                "UPDATE projects SET skills = ?1 WHERE id = ?2",
+                rusqlite::params![skills, id],
+            );
+            Json(serde_json::json!({"ok": true, "skills": skills}))
+        }
+        Err(e) => Json(serde_json::json!({"error": format!("{e}")})),
+    }
+}
+
 pub async fn list_issues(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

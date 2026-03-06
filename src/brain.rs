@@ -203,6 +203,11 @@ async fn fetch_repo_structure(owner: &str, repo: &str) -> String {
     }
 }
 
+/// Public wrapper for LLM calls from other modules
+pub async fn call_llm_pub(model: &str, system: &str, user: &str) -> Result<String> {
+    call_llm(model, system, user).await
+}
+
 async fn call_llm(model: &str, system: &str, user: &str) -> Result<String> {
     // Use OpenAI-compatible API
     let api_key = std::env::var("OPENAI_API_KEY")
