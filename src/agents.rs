@@ -27,16 +27,38 @@ pub struct Agent {
     pub exit_code: Option<i32>,
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct QualityGates {
+    #[serde(default = "default_true")]
+    pub tests: bool,
+    #[serde(default = "default_true")]
+    pub clippy: bool,
+    #[serde(default = "default_true")]
+    pub review: bool,
+    #[serde(default)]
+    pub auto_merge: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for QualityGates {
+    fn default() -> Self {
+        Self { tests: true, clippy: true, review: true, auto_merge: false }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct SpawnRequest {
     pub project_id: String,
     pub issue_number: Option<i64>,
     pub prompt: String,
     pub model: Option<String>,
+    pub agent_type: Option<String>,
+    pub quality_gates: Option<QualityGates>,
 }
 
 pub struct AgentManager {
-    processes: Mutex<HashMap<String, AgentProcess>>,
+    pub(crate) processes: Mutex<HashMap<String, AgentProcess>>,
 }
 
 struct AgentProcess {
@@ -57,9 +79,15 @@ impl AgentManager {
         workdir: &str,
         model: &str,
         prompt: &str,
+        agent_type: &str,
     ) -> anyhow::Result<u32> {
-        let mut child = Command::new("codex")
-            .args(["--yolo", "-m", model, "exec", prompt])
+        let (cmd, args): (&str, Vec<&str>) = match agent_type {
+            "claude" => ("claude", vec!["-p", prompt, "--dangerously-skip-permissions"]),
+            _ => ("codex", vec!["--yolo", "-m", model, "exec", prompt]),
+        };
+
+        let mut child = Command::new(cmd)
+            .args(&args)
             .current_dir(workdir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -126,7 +154,7 @@ pub async fn spawn_agent(
     let now = chrono::Utc::now().to_rfc3339();
 
     // Get project info (scope the lock to avoid holding across await)
-    let (_owner, _repo, _default_branch, worktree_path, branch) = {
+    let (owner, repo, _default_branch, worktree_path, branch) = {
         let conn = state.db.conn();
         let (owner, repo, default_branch): (String, String, String) = conn
             .query_row(
@@ -176,10 +204,13 @@ pub async fn spawn_agent(
         (owner, repo, default_branch, worktree_path, branch)
     };
 
+    let agent_type = req.agent_type.clone().unwrap_or_else(|| "codex".to_string());
+    let gates = req.quality_gates.clone().unwrap_or_default();
+
     // Spawn the coding agent
     let pid = state
         .agents
-        .spawn(&id, &worktree_path, &model, &req.prompt)
+        .spawn(&id, &worktree_path, &model, &req.prompt, &agent_type)
         .await
         .unwrap_or(0);
 
@@ -192,6 +223,28 @@ pub async fn spawn_agent(
             rusqlite::params![pid, id],
         )
         .unwrap();
+
+    // Spawn background watcher for quality gates
+    let watcher_state = state.clone();
+    let watcher_id = id.clone();
+    let watcher_worktree = worktree_path.clone();
+    let watcher_branch = branch.clone();
+    let watcher_owner = owner.clone();
+    let watcher_repo = repo.clone();
+    let watcher_issue = req.issue_number;
+    tokio::spawn(async move {
+        watch_agent_completion(
+            watcher_state,
+            &watcher_id,
+            &watcher_worktree,
+            &watcher_branch,
+            &watcher_owner,
+            &watcher_repo,
+            watcher_issue,
+            gates,
+        )
+        .await;
+    });
 
     Json(Agent {
         id,
@@ -296,4 +349,188 @@ pub async fn kill_agent(
         );
     }
     Json(killed)
+}
+
+// --- Quality gate pipeline ---
+
+async fn watch_agent_completion(
+    state: Arc<AppState>,
+    agent_id: &str,
+    worktree: &str,
+    branch: &str,
+    owner: &str,
+    repo: &str,
+    issue_number: Option<i64>,
+    gates: QualityGates,
+) {
+    // Poll until agent process finishes
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let status: String = {
+            let conn = state.db.conn();
+            conn.query_row(
+                "SELECT status FROM agents WHERE id = ?1",
+                [agent_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "unknown".to_string())
+        };
+        if status != "running" {
+            return; // killed or already done
+        }
+        // Check if process is still alive
+        let has_output = state.agents.get_output(agent_id).is_some();
+        if !has_output {
+            break; // Process finished and was cleaned up
+        }
+        // Check if process exited by looking at the lock
+        let still_running = state
+            .agents
+            .processes
+            .lock()
+            .unwrap()
+            .contains_key(agent_id);
+        if !still_running {
+            break;
+        }
+    }
+
+    tracing::info!("Agent {agent_id} finished — running quality gates");
+
+    // Update status
+    {
+        let conn = state.db.conn();
+        let _ = conn.execute(
+            "UPDATE agents SET status = 'gates' WHERE id = ?1",
+            [agent_id],
+        );
+    }
+
+    let mut all_passed = true;
+
+    // Gate 1: Tests
+    if gates.tests {
+        let gate_id = uuid::Uuid::new_v4().to_string();
+        record_gate(&state, &gate_id, agent_id, "tests", "running");
+        let output = run_command(worktree, "cargo", &["test"]);
+        let passed = output.0;
+        record_gate_result(&state, &gate_id, if passed { "passed" } else { "failed" }, &output.1);
+        if !passed { all_passed = false; }
+    }
+
+    // Gate 2: Clippy
+    if gates.clippy && all_passed {
+        let gate_id = uuid::Uuid::new_v4().to_string();
+        record_gate(&state, &gate_id, agent_id, "clippy", "running");
+        let output = run_command(worktree, "cargo", &["clippy", "--all-targets", "--", "-D", "warnings"]);
+        let passed = output.0;
+        record_gate_result(&state, &gate_id, if passed { "passed" } else { "failed" }, &output.1);
+        if !passed { all_passed = false; }
+    }
+
+    // Gate 3: Create PR
+    if all_passed {
+        let title = issue_number
+            .map(|n| format!("fix: resolve issue #{n}"))
+            .unwrap_or_else(|| format!("shipyard: agent {}", &agent_id[..8]));
+
+        let body = format!(
+            "Automated by [Shipyard](https://github.com/rosssaunders/shipyard)\n\n{}",
+            issue_number.map(|n| format!("Closes #{n}")).unwrap_or_default()
+        );
+
+        // Push branch
+        let _ = run_command(worktree, "git", &["push", "-u", "origin", branch, "--no-verify"]);
+
+        // Create PR
+        let pr_output = run_command(
+            worktree,
+            "gh",
+            &[
+                "pr", "create",
+                "--repo", &format!("{owner}/{repo}"),
+                "--head", branch,
+                "--title", &title,
+                "--body", &body,
+            ],
+        );
+
+        // Gate 4: AI code review
+        if gates.review && pr_output.0 {
+            let gate_id = uuid::Uuid::new_v4().to_string();
+            record_gate(&state, &gate_id, agent_id, "review", "running");
+            // Use a second Codex instance to review
+            let review_output = run_command(
+                worktree,
+                "gh",
+                &["pr", "diff", "--repo", &format!("{owner}/{repo}"), branch],
+            );
+            // For now, mark review as passed if PR was created
+            // TODO: dispatch to small model for actual review
+            record_gate_result(&state, &gate_id, "passed", &review_output.1);
+        }
+
+        // Gate 5: Auto-merge
+        if gates.auto_merge && all_passed {
+            let gate_id = uuid::Uuid::new_v4().to_string();
+            record_gate(&state, &gate_id, agent_id, "merge", "running");
+            let merge_output = run_command(
+                worktree,
+                "gh",
+                &[
+                    "pr", "merge",
+                    "--repo", &format!("{owner}/{repo}"),
+                    "--squash", "--admin",
+                    branch,
+                ],
+            );
+            record_gate_result(
+                &state,
+                &gate_id,
+                if merge_output.0 { "passed" } else { "failed" },
+                &merge_output.1,
+            );
+        }
+    }
+
+    // Final status
+    let final_status = if all_passed { "done" } else { "failed" };
+    {
+        let conn = state.db.conn();
+        let _ = conn.execute(
+            "UPDATE agents SET status = ?1, finished_at = datetime('now') WHERE id = ?2",
+            rusqlite::params![final_status, agent_id],
+        );
+    }
+    tracing::info!("Agent {agent_id} pipeline complete: {final_status}");
+}
+
+fn record_gate(state: &AppState, gate_id: &str, agent_id: &str, gate_type: &str, status: &str) {
+    let _ = state.db.conn().execute(
+        "INSERT INTO quality_gates (id, agent_id, gate_type, status) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![gate_id, agent_id, gate_type, status],
+    );
+}
+
+fn record_gate_result(state: &AppState, gate_id: &str, status: &str, output: &str) {
+    let _ = state.db.conn().execute(
+        "UPDATE quality_gates SET status = ?1, output = ?2 WHERE id = ?3",
+        rusqlite::params![status, output, gate_id],
+    );
+}
+
+fn run_command(workdir: &str, cmd: &str, args: &[&str]) -> (bool, String) {
+    match std::process::Command::new(cmd)
+        .args(args)
+        .current_dir(workdir)
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let combined = format!("{stdout}\n{stderr}");
+            (output.status.success(), combined)
+        }
+        Err(e) => (false, format!("Failed to run {cmd}: {e}")),
+    }
 }

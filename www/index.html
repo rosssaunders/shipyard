@@ -89,6 +89,68 @@
         </div>
     </div>
 
+    <!-- Dispatch Modal -->
+    <div id="dispatch-modal" class="fixed inset-0 bg-black/80 hidden z-50 flex items-end sm:items-center justify-center">
+        <div class="card w-full max-w-md p-5 mx-3 mb-3 sm:mb-0">
+            <h2 class="text-lg font-bold mb-1" id="dispatch-title">Launch Agent</h2>
+            <p class="text-xs text-zinc-500 mb-4" id="dispatch-subtitle"></p>
+
+            <div class="space-y-2 mb-4">
+                <label class="text-xs text-zinc-400">Agent</label>
+                <div class="grid grid-cols-2 gap-2" id="agent-options">
+                    <button onclick="selectDispatchAgent('codex')" class="dispatch-agent-btn card p-3 text-left border-blue-500" data-agent="codex">
+                        <div class="text-sm font-medium">Codex</div>
+                        <div class="text-[10px] text-zinc-500">OpenAI · full-auto</div>
+                    </button>
+                    <button onclick="selectDispatchAgent('claude')" class="dispatch-agent-btn card p-3 text-left" data-agent="claude">
+                        <div class="text-sm font-medium">Claude Code</div>
+                        <div class="text-[10px] text-zinc-500">Anthropic · careful</div>
+                    </button>
+                </div>
+            </div>
+
+            <div class="space-y-2 mb-4">
+                <label class="text-xs text-zinc-400">Model</label>
+                <select id="dispatch-model" class="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:outline-none">
+                    <option value="gpt-5.4">GPT-5.4</option>
+                    <option value="gpt-5.4-pro">GPT-5.4 Pro</option>
+                    <option value="gpt-5.3-codex">GPT-5.3 Codex</option>
+                    <option value="claude-opus-4">Claude Opus 4</option>
+                    <option value="claude-sonnet-4">Claude Sonnet 4</option>
+                </select>
+            </div>
+
+            <div class="space-y-2 mb-4">
+                <label class="text-xs text-zinc-400">After completion</label>
+                <div class="space-y-1">
+                    <label class="flex items-center gap-2 text-sm">
+                        <input type="checkbox" id="gate-tests" checked class="rounded"> Run tests
+                    </label>
+                    <label class="flex items-center gap-2 text-sm">
+                        <input type="checkbox" id="gate-clippy" checked class="rounded"> Clippy lint
+                    </label>
+                    <label class="flex items-center gap-2 text-sm">
+                        <input type="checkbox" id="gate-review" checked class="rounded"> AI code review
+                    </label>
+                    <label class="flex items-center gap-2 text-sm">
+                        <input type="checkbox" id="gate-merge" class="rounded"> Auto-merge if green
+                    </label>
+                </div>
+            </div>
+
+            <div class="space-y-2 mb-4">
+                <label class="text-xs text-zinc-400">Extra instructions (optional)</label>
+                <textarea id="dispatch-extra" rows="2" placeholder="e.g. Use the existing test patterns..."
+                    class="w-full bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-2 text-sm focus:outline-none resize-none"></textarea>
+            </div>
+
+            <div class="flex gap-2">
+                <button onclick="hideDispatch()" class="flex-1 bg-zinc-800 rounded-lg py-2.5 text-sm">Cancel</button>
+                <button onclick="confirmDispatch()" class="flex-1 bg-blue-600 rounded-lg py-2.5 text-sm font-medium">🚀 Launch</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Agent Detail Modal -->
     <div id="agent-modal" class="fixed inset-0 bg-black/80 hidden z-50 flex flex-col">
         <div class="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
@@ -226,16 +288,72 @@
         }).join('');
     }
 
-    async function startIssue(number, title) {
-        if (!confirm(`Start agent on #${number}: ${title}?`)) return;
+    // --- Dispatch ---
+    let dispatchIssue = null;
+    let dispatchAgent = 'codex';
+
+    function startIssue(number, title) {
+        dispatchIssue = { number, title };
+        document.getElementById('dispatch-title').textContent = `#${number}`;
+        document.getElementById('dispatch-subtitle').textContent = title;
+        document.getElementById('dispatch-extra').value = '';
+        document.getElementById('dispatch-modal').classList.remove('hidden');
+        selectDispatchAgent('codex');
+    }
+
+    function selectDispatchAgent(agent) {
+        dispatchAgent = agent;
+        document.querySelectorAll('.dispatch-agent-btn').forEach(btn => {
+            btn.classList.toggle('border-blue-500', btn.dataset.agent === agent);
+            btn.classList.toggle('border-zinc-700', btn.dataset.agent !== agent);
+        });
+        // Update model options based on agent
+        const modelSelect = document.getElementById('dispatch-model');
+        if (agent === 'codex') {
+            modelSelect.innerHTML = `
+                <option value="gpt-5.4">GPT-5.4</option>
+                <option value="gpt-5.4-pro">GPT-5.4 Pro</option>
+                <option value="gpt-5.3-codex">GPT-5.3 Codex</option>
+            `;
+        } else {
+            modelSelect.innerHTML = `
+                <option value="claude-opus-4">Claude Opus 4</option>
+                <option value="claude-sonnet-4">Claude Sonnet 4</option>
+            `;
+        }
+    }
+
+    function hideDispatch() {
+        document.getElementById('dispatch-modal').classList.add('hidden');
+        dispatchIssue = null;
+    }
+
+    async function confirmDispatch() {
+        if (!dispatchIssue || !activeProjectId) return;
+        const model = document.getElementById('dispatch-model').value;
+        const extra = document.getElementById('dispatch-extra').value.trim();
+        const gates = {
+            tests: document.getElementById('gate-tests').checked,
+            clippy: document.getElementById('gate-clippy').checked,
+            review: document.getElementById('gate-review').checked,
+            auto_merge: document.getElementById('gate-merge').checked,
+        };
+
+        let prompt = `Fix issue #${dispatchIssue.number}: ${dispatchIssue.title}. Read the issue on GitHub with \`gh issue view ${dispatchIssue.number}\` for full context. Implement the fix, ensure all tests pass, commit and push.`;
+        if (extra) prompt += `\n\nAdditional instructions: ${extra}`;
+
         await api('/agents/spawn', {
             method: 'POST',
             body: {
                 project_id: activeProjectId,
-                issue_number: number,
-                prompt: `Fix issue #${number}: ${title}. Read the issue on GitHub for full context. Implement the fix, run tests, commit and push.`,
+                issue_number: dispatchIssue.number,
+                prompt,
+                model,
+                agent_type: dispatchAgent,
+                quality_gates: gates,
             },
         });
+        hideDispatch();
         switchView('agents');
     }
 
@@ -267,27 +385,36 @@
                 <div class="text-center text-zinc-500 py-12">
                     <p class="text-2xl mb-3">🔨</p>
                     <p>No agents running</p>
-                    <p class="text-sm mt-1">Use the chat to start work</p>
+                    <p class="text-sm mt-1">Tap an issue to start work</p>
                 </div>`;
             return;
         }
 
-        main.innerHTML = projectAgents.map(a => `
+        main.innerHTML = projectAgents.map(a => {
+            const statusIcon = {
+                running: '⚡', gates: '🔍', done: '✅', failed: '❌', killed: '💀', pending: '⏳'
+            }[a.status] || '❓';
+            const statusLabel = {
+                running: 'Agent working', gates: 'Running quality gates', done: 'Complete',
+                failed: 'Failed', killed: 'Killed', pending: 'Pending'
+            }[a.status] || a.status;
+
+            return `
             <div class="card p-4 active:bg-zinc-800 cursor-pointer" onclick="showAgent('${a.id}')">
                 <div class="flex items-center justify-between mb-2">
                     <div class="flex items-center gap-2">
-                        <span class="w-2 h-2 rounded-full ${statusColor(a.status)} ${a.status === 'running' ? 'pulse-dot' : ''}"></span>
+                        <span class="w-2 h-2 rounded-full ${statusColor(a.status)} ${['running','gates'].includes(a.status) ? 'pulse-dot' : ''}"></span>
                         <span class="text-sm font-medium">${a.issue_number ? '#' + a.issue_number : a.id.slice(0, 8)}</span>
                     </div>
                     <span class="text-xs text-zinc-500">${a.model}</span>
                 </div>
                 <p class="text-xs text-zinc-400 line-clamp-2">${escHtml(a.prompt.slice(0, 120))}</p>
                 <div class="flex items-center justify-between mt-2">
-                    <span class="text-xs status-${a.status}">${a.status}</span>
+                    <span class="text-xs status-${a.status}">${statusIcon} ${statusLabel}</span>
                     <span class="text-xs text-zinc-600">${timeAgo(a.created_at)}</span>
                 </div>
-            </div>
-        `).join('');
+            </div>`;
+        }).join('');
     }
 
     function renderEmpty() {
