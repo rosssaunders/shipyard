@@ -200,6 +200,37 @@ header .badge {
   pointer-events: none;
 }
 
+/* Live output panel */
+.live-panel {
+  position: fixed; inset: 0; background: var(--bg); z-index: 50;
+  display: flex; flex-direction: column;
+}
+.live-header {
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  display: flex; justify-content: space-between; align-items: center;
+}
+.live-header h2 { font-size: 16px; font-weight: 600; }
+.live-header .close-btn {
+  background: var(--surface2); border: none; border-radius: 8px;
+  padding: 6px 14px; color: var(--text); font-size: 14px; cursor: pointer;
+}
+.live-status {
+  padding: 8px 20px; border-bottom: 1px solid var(--border);
+  display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--text2);
+}
+.live-output {
+  flex: 1; overflow-y: auto; padding: 12px 20px;
+  font-family: 'SF Mono', 'Menlo', monospace; font-size: 12px;
+  line-height: 1.6; white-space: pre-wrap; word-break: break-all;
+  color: var(--text2); -webkit-overflow-scrolling: touch;
+}
+.live-output .line-read { color: #64748b; }
+.live-output .line-write { color: #22c55e; }
+.live-output .line-run { color: #eab308; }
+.live-output .line-error { color: #ef4444; }
+.live-output .line-think { color: #8b5cf6; }
+.live-output .line-commit { color: #3b82f6; }
+
 .hidden { display: none !important; }
 </style>
 </head>
@@ -236,6 +267,20 @@ header .badge {
   <button onclick="switchTab('attention', this)">
     Needs You <span id="attention-count" class="count hidden">0</span>
   </button>
+</div>
+
+<!-- Live output panel -->
+<div id="live-panel" class="live-panel hidden">
+  <div class="live-header">
+    <h2 id="live-title">Agent Output</h2>
+    <button class="close-btn" onclick="closeLive()">✕ Close</button>
+  </div>
+  <div class="live-status">
+    <span class="status-dot running" id="live-dot"></span>
+    <span id="live-status-text">Running...</span>
+    <span style="margin-left:auto" id="live-size">0 KB</span>
+  </div>
+  <div class="live-output" id="live-output"></div>
 </div>
 
 <div id="feed-view" class="feed"></div>
@@ -325,29 +370,7 @@ async function loadFeed() {
 }
 
 function renderFeed() {
-  const el = document.getElementById('feed-view');
-  if (feedEvents.length === 0) {
-    el.innerHTML = `
-      <div class="empty">
-        <div class="emoji">⚓</div>
-        <p>Nothing happening yet.<br>Tell me what you want built.</p>
-      </div>`;
-    return;
-  }
-  el.innerHTML = feedEvents.map(ev => `
-    <div class="event" onclick="toggleDetail(this)">
-      <div class="icon">${ev.icon}</div>
-      <div class="body">
-        <div class="title">${ev.message}</div>
-        <div class="meta">
-          <span class="status-dot ${ev.task_status || ''}"></span>
-          <span>${timeAgo(ev.created_at)}</span>
-          ${ev.repo ? `<span class="repo-tag">${ev.repo}</span>` : ''}
-        </div>
-        ${ev.detail ? `<div class="detail">${escHtml(ev.detail)}</div>` : ''}
-      </div>
-    </div>
-  `).join('');
+  renderFeedWithLive();
 }
 
 function toggleDetail(el) {
@@ -476,6 +499,107 @@ async function launchIssue(number, title, btn) {
 
 function escAttr(s) {
   return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
+// --- Live Output ---
+let liveTaskId = null;
+let liveOffset = 0;
+let liveInterval = null;
+
+function openLive(taskId, title) {
+  liveTaskId = taskId;
+  liveOffset = 0;
+  document.getElementById('live-panel').classList.remove('hidden');
+  document.getElementById('live-title').textContent = title || 'Agent Output';
+  document.getElementById('live-output').innerHTML = '';
+  pollLive();
+  liveInterval = setInterval(pollLive, 2000);
+}
+
+function closeLive() {
+  document.getElementById('live-panel').classList.add('hidden');
+  liveTaskId = null;
+  if (liveInterval) { clearInterval(liveInterval); liveInterval = null; }
+}
+
+async function pollLive() {
+  if (!liveTaskId) return;
+  try {
+    const res = await fetch(`${API}/api/tasks/${liveTaskId}/output?offset=${liveOffset}`);
+    const data = await res.json();
+    if (data.output) {
+      const el = document.getElementById('live-output');
+      el.innerHTML += colorize(escHtml(data.output));
+      liveOffset = data.offset;
+      el.scrollTop = el.scrollHeight;
+      document.getElementById('live-size').textContent = `${(liveOffset/1024).toFixed(1)} KB`;
+    }
+    const dot = document.getElementById('live-dot');
+    const status = document.getElementById('live-status-text');
+    if (data.running) {
+      dot.className = 'status-dot running';
+      status.textContent = 'Running...';
+    } else {
+      dot.className = 'status-dot done';
+      status.textContent = 'Finished';
+      if (liveInterval) { clearInterval(liveInterval); liveInterval = null; }
+    }
+  } catch (e) {}
+}
+
+function colorize(text) {
+  return text.split('\n').map(line => {
+    if (line.match(/reading|read |scanning|inspecting/i)) return `<span class="line-read">${line}</span>`;
+    if (line.match(/writing|wrote|creating|created/i)) return `<span class="line-write">${line}</span>`;
+    if (line.match(/running|cargo test|cargo clippy|npm |exec/i)) return `<span class="line-run">${line}</span>`;
+    if (line.match(/error|failed|panic/i)) return `<span class="line-error">${line}</span>`;
+    if (line.match(/thinking|analyzing|planning|consider/i)) return `<span class="line-think">${line}</span>`;
+    if (line.match(/commit|push|merge|branch/i)) return `<span class="line-commit">${line}</span>`;
+    return line;
+  }).join('\n');
+}
+
+// Make feed events tappable for live view
+function renderFeedWithLive() {
+  const el = document.getElementById('feed-view');
+  if (feedEvents.length === 0) {
+    el.innerHTML = `
+      <div class="empty">
+        <div class="emoji">⚓</div>
+        <p>Nothing happening yet.<br>Tell me what you want built.</p>
+      </div>`;
+    return;
+  }
+
+  // Group events by task
+  const tasks = {};
+  feedEvents.forEach(ev => {
+    const tid = ev.task_id || ev.id;
+    if (!tasks[tid]) tasks[tid] = { events: [], status: ev.task_status, title: '', id: tid };
+    tasks[tid].events.push(ev);
+    if (ev.message.startsWith('Intent received:')) tasks[tid].title = ev.message.replace('Intent received: ', '');
+    if (!tasks[tid].title && ev.message.includes('Complexity')) tasks[tid].title = ev.message;
+  });
+
+  // Render as task cards with latest event
+  el.innerHTML = Object.values(tasks).map(task => {
+    const latest = task.events[0];
+    const isRunning = task.status === 'running';
+    return `
+      <div class="event" onclick="${isRunning ? `openLive('${task.id}', '${escAttr(task.title)}')` : `toggleDetail(this)`}" style="${isRunning ? 'cursor:pointer; border-left: 3px solid var(--accent);' : ''}">
+        <div class="icon">${latest.icon}</div>
+        <div class="body">
+          <div class="title">${isRunning ? '🔴 ' : ''}${latest.message}</div>
+          <div class="meta">
+            <span class="status-dot ${task.status || ''}"></span>
+            <span>${timeAgo(latest.created_at)}</span>
+            ${latest.repo ? `<span class="repo-tag">${latest.repo}</span>` : ''}
+            ${isRunning ? '<span style="color:var(--accent)">tap to watch →</span>' : ''}
+          </div>
+          ${!isRunning && task.events.length > 1 ? `<div class="detail">${task.events.map(e => `${e.icon} ${e.message}`).join('\n')}</div>` : ''}
+        </div>
+      </div>`;
+  }).join('');
 }
 
 // --- Skills ---

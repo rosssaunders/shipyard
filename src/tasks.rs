@@ -20,6 +20,7 @@ pub struct IntentRequest {
 #[derive(Serialize)]
 pub struct FeedEvent {
     pub id: String,
+    pub task_id: String,
     pub icon: String,
     pub message: String,
     pub detail: Option<String>,
@@ -131,7 +132,7 @@ pub async fn get_feed(
 ) -> Json<Vec<FeedEvent>> {
     let conn = state.db.conn();
     let mut stmt = conn.prepare(
-        "SELECT e.id, e.icon, e.message, e.detail, e.created_at, t.status, p.repo
+        "SELECT e.id, e.task_id, e.icon, e.message, e.detail, e.created_at, t.status, p.repo
          FROM task_events e
          JOIN tasks t ON t.id = e.task_id
          LEFT JOIN projects p ON p.id = t.project_id
@@ -142,12 +143,13 @@ pub async fn get_feed(
     let events: Vec<FeedEvent> = stmt.query_map([], |row| {
         Ok(FeedEvent {
             id: row.get::<_, i64>(0)?.to_string(),
-            icon: row.get(1)?,
-            message: row.get(2)?,
-            detail: row.get(3)?,
-            created_at: row.get(4)?,
-            task_status: row.get(5)?,
-            repo: row.get(6)?,
+            task_id: row.get(1)?,
+            icon: row.get(2)?,
+            message: row.get(3)?,
+            detail: row.get(4)?,
+            created_at: row.get(5)?,
+            task_status: row.get(6)?,
+            repo: row.get(7)?,
         })
     }).unwrap().filter_map(|r| r.ok()).collect();
 
@@ -467,6 +469,31 @@ fn get_task_from_db(state: &AppState, id: &str) -> Option<Task> {
             events: vec![],
         }),
     ).ok()
+}
+
+/// GET /api/tasks/:id/output — live agent output (last N chars)
+pub async fn get_live_output(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let offset: usize = params.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
+    
+    if let Some(output) = state.agents.get_output(&id) {
+        let total = output.len();
+        let chunk = if offset < total { &output[offset..] } else { "" };
+        Json(serde_json::json!({
+            "output": chunk,
+            "offset": total,
+            "running": state.agents.is_running(&id),
+        }))
+    } else {
+        Json(serde_json::json!({
+            "output": "",
+            "offset": 0,
+            "running": false,
+        }))
+    }
 }
 
 pub async fn kill_task(
