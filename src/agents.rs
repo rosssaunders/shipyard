@@ -62,7 +62,7 @@ pub struct AgentManager {
 }
 
 struct AgentProcess {
-    _child: Child,
+    finished: Arc<std::sync::atomic::AtomicBool>,
     output: Arc<Mutex<String>>,
 }
 
@@ -109,16 +109,29 @@ impl AgentManager {
         let output_clone = output.clone();
         let log_file_clone = log_file.clone();
 
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finished_clone = finished.clone();
+
         // Tail the log file in background
         tokio::spawn(async move {
             let mut last_size = 0u64;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if finished_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    // One final read after exit
+                    if let Ok(content) = tokio::fs::read_to_string(&log_file_clone).await {
+                        if content.len() as u64 > last_size {
+                            let new_content = &content[last_size as usize..];
+                            let cleaned = strip_ansi(new_content);
+                            output_clone.lock().unwrap().push_str(&cleaned);
+                        }
+                    }
+                    break;
+                }
                 if let Ok(content) = tokio::fs::read_to_string(&log_file_clone).await {
                     let new_len = content.len() as u64;
                     if new_len > last_size {
                         let new_content = &content[last_size as usize..];
-                        // Strip ANSI escape codes for cleaner output
                         let cleaned = strip_ansi(new_content);
                         output_clone.lock().unwrap().push_str(&cleaned);
                         last_size = new_len;
@@ -130,16 +143,27 @@ impl AgentManager {
         self.processes.lock().unwrap().insert(
             id.to_string(),
             AgentProcess {
-                _child: child,
+                finished: finished.clone(),
                 output,
             },
         );
+
+        // Wait for child exit in background, then mark finished
+        let wait_finished = finished.clone();
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            wait_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
 
         Ok(pid)
     }
 
     pub fn is_running(&self, id: &str) -> bool {
-        self.processes.lock().unwrap().contains_key(id)
+        if let Some(proc) = self.processes.lock().unwrap().get(id) {
+            !proc.finished.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            false
+        }
     }
 
     pub fn get_output(&self, id: &str) -> Option<String> {
@@ -151,8 +175,12 @@ impl AgentManager {
     }
 
     pub fn kill(&self, id: &str) -> bool {
-        if let Some(mut process) = self.processes.lock().unwrap().remove(id) {
-            let _ = process._child.start_kill();
+        if let Some(process) = self.processes.lock().unwrap().get(id) {
+            process.finished.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Kill the process group
+            let _ = std::process::Command::new("pkill")
+                .args(["-f", &format!("shipyard/{}", id)])
+                .spawn();
             true
         } else {
             false

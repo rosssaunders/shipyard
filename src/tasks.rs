@@ -93,6 +93,28 @@ pub async fn submit_intent(
         conn.query_row("SELECT default_branch FROM projects WHERE id = ?1", [&project_id], |r| r.get::<_,String>(0))
             .unwrap_or_else(|_| "main".to_string())
     };
+
+    // Clean up any stale branch/worktree with the same name
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", &worktree_path])
+        .current_dir(&repo_path)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &branch])
+        .current_dir(&repo_path)
+        .output();
+    // Also delete remote branch if it exists
+    let _ = std::process::Command::new("git")
+        .args(["push", "origin", "--delete", &branch, "--no-verify"])
+        .current_dir(&repo_path)
+        .output();
+
+    // Pull latest before creating worktree
+    let _ = std::process::Command::new("git")
+        .args(["pull", "--ff-only"])
+        .current_dir(&repo_path)
+        .output();
+
     let _ = std::process::Command::new("git")
         .args(["worktree", "add", "-b", &branch, &worktree_path, &default_branch])
         .current_dir(&repo_path)
@@ -410,6 +432,21 @@ pub async fn create_task(
     );
 
     let _ = std::fs::create_dir_all(&worktree_path);
+
+    // Clean up stale branch/worktree
+    let _ = std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", &worktree_path])
+        .current_dir(&repo_path).output();
+    let _ = std::process::Command::new("git")
+        .args(["branch", "-D", &branch])
+        .current_dir(&repo_path).output();
+    let _ = std::process::Command::new("git")
+        .args(["push", "origin", "--delete", &branch, "--no-verify"])
+        .current_dir(&repo_path).output();
+    let _ = std::process::Command::new("git")
+        .args(["pull", "--ff-only"])
+        .current_dir(&repo_path).output();
+
     let _ = std::process::Command::new("git")
         .args(["worktree", "add", "-b", &branch, &worktree_path, &default_branch])
         .current_dir(&repo_path)
