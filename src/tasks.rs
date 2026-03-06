@@ -679,42 +679,46 @@ async fn run_task_pipeline(
     add_event(&state, &task_id, "info", "📝",
         &format!("{commit_count} commit(s) ready"), None);
 
-    let mut all_passed = true;
+    // Run quality gates from project skills (Layer 1: Supervisor)
+    let mut attempt = 0u32;
+    let mut all_passed = loop {
+        attempt += 1;
+        let results = crate::supervisor::run_skill_gates(&state, &task_id, worktree).await;
+        let failures: Vec<_> = results.iter().filter(|r| !r.passed).collect();
 
-    // Gate: Tests
-    if gates.tests {
-        add_event(&state, &task_id, "gate", "🧪", "Running tests...", None);
-        let result = run_cmd(&worktree, "cargo", &["test"]);
-        if result.0 {
-            // Extract test count from output
-            let summary = result.1.lines()
-                .filter(|l| l.contains("test result:"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            add_event(&state, &task_id, "gate", "✅",
-                &format!("Tests passed{}", if summary.is_empty() { String::new() } else { format!(" — {summary}") }),
-                Some(&result.1));
-        } else {
-            add_event(&state, &task_id, "gate", "❌", "Tests failed", Some(&result.1));
-            all_passed = false;
+        if failures.is_empty() {
+            break true;
         }
-    }
 
-    // Gate: Clippy
-    if gates.clippy && all_passed {
-        add_event(&state, &task_id, "gate", "📎", "Running clippy...", None);
-        let result = run_cmd(&worktree, "cargo", &["clippy", "--all-targets", "--", "-D", "warnings"]);
-        if result.0 {
-            add_event(&state, &task_id, "gate", "✅", "Clippy clean", None);
-        } else {
-            add_event(&state, &task_id, "gate", "❌", "Clippy warnings found", Some(&result.1));
-            all_passed = false;
+        // Supervisor: attempt to fix
+        add_event(&state, &task_id, "supervisor", "🔧",
+            &format!("Supervisor: {} gate(s) failed, dispatching fixer (attempt {})",
+                failures.len(), attempt), None);
+
+        let failed_results: Vec<_> = results.into_iter().filter(|r| !r.passed).collect();
+        let fixed = crate::supervisor::attempt_fix(
+            &state, &task_id, worktree, &failed_results, &model, attempt,
+        ).await;
+
+        if !fixed {
+            break false;
         }
-    }
+
+        // Auto-commit fixer changes
+        let status = run_cmd(worktree, "git", &["status", "--porcelain"]);
+        if status.0 && !status.1.trim().is_empty() {
+            let _ = run_cmd(worktree, "git", &["add", "-A"]);
+            let _ = run_cmd(worktree, "git", &["commit", "-m",
+                &format!("fix: resolve gate failures (attempt {attempt})")]);
+        }
+
+        add_event(&state, &task_id, "supervisor", "🔄", "Re-running gates...", None);
+    };
 
     if !all_passed {
         update_task_status(&state, &task_id, "failed");
-        add_event(&state, &task_id, "system", "❌", "Quality gates failed", None);
+        add_event(&state, &task_id, "supervisor", "❌", "Supervisor: gates failed after all fix attempts", None);
+        learn_from_task(&state, &task_id, &title, &model).await;
         return;
     }
 
@@ -941,6 +945,10 @@ async fn learn_from_task(state: &Arc<AppState>, task_id: &str, title: &str, mode
     }
 }
 
+pub fn run_cmd_timeout_pub(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
+    run_cmd_timeout(workdir, cmd, args, timeout_secs)
+}
+
 fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
     match std::process::Command::new(cmd)
         .args(args)
@@ -964,7 +972,7 @@ fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -
     }
 }
 
-fn run_cmd(workdir: &str, cmd: &str, args: &[&str]) -> (bool, String) {
+pub fn run_cmd(workdir: &str, cmd: &str, args: &[&str]) -> (bool, String) {
     match std::process::Command::new(cmd)
         .args(args)
         .current_dir(workdir)

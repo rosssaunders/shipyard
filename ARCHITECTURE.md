@@ -1,5 +1,29 @@
 # Shipyard Architecture
 
+## Three Layers
+
+```
+Layer 1: SHIPYARD BRAIN / SUPERVISOR (CTO)
+├── Sees all tasks across all projects
+├── Steps in when tasks fail — dispatches fixer agents
+├── Runs project-specific quality gates from Skills
+├── Retry loop: fix → re-run gates → fix → re-run (max 3)
+├── Learns from outcomes — updates Skills after every task
+├── Clean context — never sees code
+│
+├── Layer 2: TASK BRAIN (Tech Lead)
+│   ├── Owns one task lifecycle
+│   ├── Reads issue, plans approach, assesses complexity
+│   ├── Writes detailed prompt for coding agent
+│   ├── Medium context — sees file list, errors, summaries
+│   │
+│   └── Layer 3: CODING AGENT (Dev)
+│       ├── Codex / Claude Code
+│       ├── Reads files, writes code, runs tests
+│       ├── Full dirty context — entire codebase
+│       └── Disposable — new instance per attempt
+```
+
 ## The Brain
 
 The brain is a **state-of-the-art model** (Claude Opus / GPT-5.4 Pro) that acts as an engineering lead. It's not a router — it thinks.

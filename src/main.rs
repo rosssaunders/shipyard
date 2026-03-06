@@ -2,6 +2,7 @@ mod db;
 mod agents;
 mod brain;
 mod projects;
+mod supervisor;
 mod tasks;
 mod ws;
 
