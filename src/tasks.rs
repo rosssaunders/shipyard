@@ -14,6 +14,7 @@ use crate::agents::QualityGates;
 pub struct IntentRequest {
     pub text: String,
     pub project_id: Option<String>,
+    pub issue_number: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -72,8 +73,13 @@ pub async fn submit_intent(
     let model = "gpt-5.4".to_string();
     let agent_type = "codex".to_string();
     let now = chrono::Utc::now().to_rfc3339();
-    let branch = format!("shipyard/{}", &id[..8]);
     let worktree_path = format!("/tmp/shipyard/{}/{}", repo, &id[..8]);
+    let issue_number = req.issue_number;
+    let branch = if let Some(n) = issue_number {
+        format!("shipyard/issue-{n}")
+    } else {
+        format!("shipyard/{}", &id[..8])
+    };
 
     // Create worktree
     let repo_path = format!(
@@ -91,13 +97,13 @@ pub async fn submit_intent(
         .current_dir(&repo_path)
         .output();
 
-    // Insert task with the raw intent as title
+    // Insert task
     {
         let conn = state.db.conn();
         conn.execute(
             "INSERT INTO tasks (id, project_id, issue_number, title, status, agent_type, model, worktree_path, branch, created_at, auto_merge)
-             VALUES (?1, ?2, NULL, ?3, 'running', ?4, ?5, ?6, ?7, ?8, 1)",
-            rusqlite::params![id, project_id, req.text, agent_type, model, worktree_path, branch, now],
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8, ?9, 1)",
+            rusqlite::params![id, project_id, issue_number, req.text, agent_type, model, worktree_path, branch, now],
         ).unwrap();
     }
 
@@ -107,10 +113,11 @@ pub async fn submit_intent(
     let bg_state = state.clone();
     let bg_id = id.clone();
     let bg_text = req.text.clone();
+    let bg_branch = branch.clone();
     tokio::spawn(async move {
         run_task_pipeline(
             bg_state, bg_id, owner, repo, model, agent_type,
-            branch, worktree_path, bg_text, None, None,
+            bg_branch, worktree_path, bg_text, issue_number, None,
             QualityGates { tests: true, clippy: true, review: true, auto_merge: true },
         ).await;
     });

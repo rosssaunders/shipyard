@@ -164,6 +164,42 @@ header .badge {
   color: white; font-weight: 600; font-size: 16px; cursor: pointer;
 }
 
+/* Issue cards */
+.issue-card {
+  padding: 14px 20px; border-bottom: 1px solid var(--border);
+  display: flex; gap: 12px; align-items: flex-start;
+  cursor: pointer; transition: background 0.15s;
+}
+.issue-card:active { background: var(--surface); }
+.issue-card .issue-num {
+  color: var(--text2); font-size: 13px; font-weight: 500;
+  flex-shrink: 0; min-width: 36px;
+}
+.issue-card .issue-body { flex: 1; min-width: 0; }
+.issue-card .issue-title {
+  font-size: 14px; font-weight: 500; line-height: 1.4;
+}
+.issue-card .issue-labels {
+  display: flex; gap: 4px; flex-wrap: wrap; margin-top: 6px;
+}
+.issue-card .label {
+  font-size: 11px; padding: 2px 8px; border-radius: 10px;
+  background: var(--surface2); color: var(--text2);
+}
+.issue-card .label.p0 { background: #3b1111; color: var(--red); }
+.issue-card .label.phase1 { background: #1a2332; color: var(--accent); }
+.issue-card .launch-btn {
+  flex-shrink: 0; background: var(--accent); border: none;
+  border-radius: 8px; padding: 8px 14px; color: white;
+  font-size: 13px; font-weight: 600; cursor: pointer;
+  align-self: center;
+}
+.issue-card .launch-btn:active { opacity: 0.8; }
+.issue-card .launch-btn.launched {
+  background: var(--surface2); color: var(--text2);
+  pointer-events: none;
+}
+
 .hidden { display: none !important; }
 </style>
 </head>
@@ -193,12 +229,16 @@ header .badge {
 
 <div class="tabs">
   <button class="active" onclick="switchTab('feed', this)">Feed</button>
+  <button onclick="switchTab('backlog', this)">
+    Backlog <span id="backlog-count" class="count hidden">0</span>
+  </button>
   <button onclick="switchTab('attention', this)">
     Needs You <span id="attention-count" class="count hidden">0</span>
   </button>
 </div>
 
 <div id="feed-view" class="feed"></div>
+<div id="backlog-view" class="feed hidden"></div>
 <div id="attention-view" class="feed hidden"></div>
 
 <script>
@@ -352,14 +392,91 @@ async function resolveAttention(id, action) {
   loadFeed();
 }
 
+// --- Backlog ---
+let backlogIssues = [];
+let launchedIssues = new Set();
+
+async function loadBacklog() {
+  if (!projects.length) return;
+  try {
+    const res = await fetch(`${API}/api/projects/${projects[0].id}/issues`);
+    if (!res.ok) return;
+    backlogIssues = await res.json();
+    renderBacklog();
+    const countEl = document.getElementById('backlog-count');
+    countEl.textContent = backlogIssues.length;
+    if (backlogIssues.length > 0) countEl.classList.remove('hidden');
+  } catch (e) {}
+}
+
+function renderBacklog() {
+  const el = document.getElementById('backlog-view');
+  if (backlogIssues.length === 0) {
+    el.innerHTML = `
+      <div class="empty">
+        <div class="emoji">📋</div>
+        <p>No open issues.<br>Your backlog is clean!</p>
+      </div>`;
+    return;
+  }
+  el.innerHTML = backlogIssues.map(issue => {
+    const launched = launchedIssues.has(issue.number);
+    const labels = (issue.labels || []).map(l => {
+      const cls = l.name === 'P0' ? 'p0' : l.name?.startsWith('phase') ? 'phase1' : '';
+      return `<span class="label ${cls}">${escHtml(l.name || l)}</span>`;
+    }).join('');
+    return `
+      <div class="issue-card">
+        <span class="issue-num">#${issue.number}</span>
+        <div class="issue-body">
+          <div class="issue-title">${escHtml(issue.title)}</div>
+          <div class="issue-labels">${labels}</div>
+        </div>
+        <button class="launch-btn ${launched ? 'launched' : ''}"
+                onclick="event.stopPropagation(); launchIssue(${issue.number}, '${escAttr(issue.title)}', this)">
+          ${launched ? '✓ Sent' : '▶ Go'}
+        </button>
+      </div>`;
+  }).join('');
+}
+
+async function launchIssue(number, title, btn) {
+  if (launchedIssues.has(number)) return;
+  launchedIssues.add(number);
+  btn.textContent = '...';
+  btn.classList.add('launched');
+
+  await fetch(`${API}/api/intent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      text: `Fix issue #${number}: ${title}`,
+      project_id: projects[0]?.id,
+      issue_number: number,
+    }),
+  });
+
+  btn.textContent = '✓ Sent';
+  // Switch to feed to watch it
+  setTimeout(() => {
+    document.querySelector('.tabs button').click();
+  }, 500);
+}
+
+function escAttr(s) {
+  return s.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+}
+
 // --- Tabs ---
 function switchTab(tab, btn) {
   activeTab = tab;
   document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('feed-view').classList.toggle('hidden', tab !== 'feed');
+  document.getElementById('backlog-view').classList.toggle('hidden', tab !== 'backlog');
   document.getElementById('attention-view').classList.toggle('hidden', tab !== 'attention');
   if (tab === 'attention') loadAttention();
+  if (tab === 'backlog') loadBacklog();
   if (tab === 'feed') loadFeed();
 }
 
