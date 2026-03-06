@@ -1,5 +1,6 @@
 mod db;
 mod agents;
+mod brain;
 mod projects;
 mod tasks;
 mod ws;

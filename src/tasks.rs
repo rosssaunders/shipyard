@@ -238,19 +238,53 @@ pub async fn create_task(
         ).unwrap();
     }
 
-    // First event
-    add_event(&state, &id, "dispatch", "🧠",
-        &format!("Dispatched to {} ({})", agent_type, model), None);
+    // Brain planning phase
+    add_event(&state, &id, "brain", "🧠", "Brain is analyzing the task...", None);
 
-    // Build prompt
-    let mut prompt = if let Some(issue_num) = req.issue_number {
-        format!("Fix issue #{issue_num}: {}. Run `gh issue view {issue_num}` for full context. Implement the fix, ensure all tests pass, commit and push.", req.title)
-    } else {
-        req.title.clone()
+    let plan = crate::brain::plan_task(
+        &owner,
+        &repo,
+        req.issue_number,
+        &req.title,
+        req.extra_instructions.as_deref(),
+        &model,
+        None, // TODO: load project-specific context
+    )
+    .await;
+
+    let prompt = match &plan {
+        Ok(plan) => {
+            add_event(&state, &id, "brain", "🧠",
+                &format!("Complexity: {}/5 — {}", plan.complexity, plan.assessment),
+                None);
+
+            if plan.subtasks.len() > 1 {
+                add_event(&state, &id, "brain", "🧠",
+                    &format!("Breaking into {} subtasks", plan.subtasks.len()),
+                    Some(&plan.subtasks.iter().map(|s| format!("• {}", s.title)).collect::<Vec<_>>().join("\n")));
+            }
+
+            // For now, concatenate all subtask prompts (TODO: sequential dispatch)
+            plan.subtasks.iter().map(|s| s.prompt.as_str()).collect::<Vec<_>>().join("\n\n---\n\n")
+        }
+        Err(e) => {
+            add_event(&state, &id, "brain", "⚠️",
+                &format!("Brain planning failed, using basic prompt: {e}"), None);
+            // Fallback to basic prompt
+            let mut p = if let Some(issue_num) = req.issue_number {
+                format!("Fix issue #{issue_num}: {}. Run `gh issue view {issue_num}` for full context. Implement the fix, ensure all tests pass, commit and push.", req.title)
+            } else {
+                req.title.clone()
+            };
+            if let Some(extra) = &req.extra_instructions {
+                p.push_str(&format!("\n\nAdditional instructions: {extra}"));
+            }
+            p
+        }
     };
-    if let Some(extra) = &req.extra_instructions {
-        prompt.push_str(&format!("\n\nAdditional instructions: {extra}"));
-    }
+
+    add_event(&state, &id, "dispatch", "🚀",
+        &format!("Dispatching to {} ({})", agent_type, model), None);
 
     // Spawn agent
     let pid = state
@@ -418,8 +452,38 @@ async fn watch_task(
         add_event(&state, &task_id, "error", "⚠️", "Failed to create PR", Some(&pr.1));
     }
 
+    // Brain review
+    if gates.review {
+        add_event(&state, &task_id, "brain", "🧠", "Brain is reviewing the diff...", None);
+        let diff_output = run_cmd(&worktree, "git", &["diff", "HEAD~1"]);
+        if diff_output.0 && !diff_output.1.trim().is_empty() {
+            let model = {
+                let conn = state.db.conn();
+                conn.query_row("SELECT model FROM tasks WHERE id = ?1", [task_id.as_str()], |r| r.get::<_,String>(0))
+                    .unwrap_or_else(|_| "gpt-5.4".to_string())
+            };
+            match crate::brain::review_diff(&diff_output.1, &task_id, &model, None).await {
+                Ok(review) => {
+                    if review.approved {
+                        add_event(&state, &task_id, "brain", "✅",
+                            &format!("Review approved: {}", review.summary), None);
+                    } else {
+                        add_event(&state, &task_id, "brain", "❌",
+                            &format!("Review rejected: {}", review.summary),
+                            Some(&review.issues.join("\n")));
+                        all_passed = false;
+                    }
+                }
+                Err(e) => {
+                    add_event(&state, &task_id, "brain", "⚠️",
+                        &format!("Brain review error: {e}"), None);
+                }
+            }
+        }
+    }
+
     // Auto-merge
-    if gates.auto_merge {
+    if gates.auto_merge && all_passed {
         add_event(&state, &task_id, "system", "🔀", "Auto-merging...", None);
         let merge = run_cmd(&worktree, "gh", &[
             "pr", "merge",
