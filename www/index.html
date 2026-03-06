@@ -41,6 +41,14 @@
         <div id="project-tabs" class="flex gap-1 px-3 pt-2 overflow-x-auto no-scrollbar">
         </div>
 
+        <!-- View tabs -->
+        <div id="view-tabs" class="flex gap-1 px-3 pt-2 hidden">
+            <button onclick="switchView('agents')" id="tab-agents"
+                class="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-400">🔨 Agents</button>
+            <button onclick="switchView('issues')" id="tab-issues"
+                class="px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-400">📋 Issues</button>
+        </div>
+
         <!-- Main content -->
         <main id="main-content" class="flex-1 overflow-y-auto px-3 py-3 space-y-3">
             <div class="text-center text-zinc-500 py-20">
@@ -99,6 +107,8 @@
     let projects = [];
     let activeProjectId = null;
     let agents = {};
+    let issues = {};
+    let activeView = 'issues'; // default to issues
     let ws = null;
     let currentAgentId = null;
 
@@ -161,7 +171,72 @@
     async function selectProject(id) {
         activeProjectId = id;
         renderProjectTabs();
-        await loadAgents(id);
+        document.getElementById('view-tabs').classList.remove('hidden');
+        if (activeView === 'issues') {
+            await loadIssues(id);
+        } else {
+            await loadAgents(id);
+        }
+    }
+
+    function switchView(view) {
+        activeView = view;
+        document.getElementById('tab-agents').className =
+            `px-3 py-1.5 rounded-lg text-xs font-medium ${view === 'agents' ? 'bg-blue-600 text-white' : 'bg-zinc-800 text-zinc-400'}`;
+        document.getElementById('tab-issues').className =
+            `px-3 py-1.5 rounded-lg text-xs font-medium ${view === 'issues' ? 'bg-blue-600 text-white' : 'bg-zinc-800 text-zinc-400'}`;
+        if (activeProjectId) {
+            if (view === 'issues') loadIssues(activeProjectId);
+            else loadAgents(activeProjectId);
+        }
+    }
+
+    // --- Issues ---
+    async function loadIssues(projectId) {
+        issues[projectId] = await api(`/projects/${projectId}/issues`);
+        renderIssues();
+    }
+
+    function renderIssues() {
+        const main = document.getElementById('main-content');
+        const projectIssues = issues[activeProjectId] || [];
+
+        if (projectIssues.length === 0) {
+            main.innerHTML = `
+                <div class="text-center text-zinc-500 py-12">
+                    <p class="text-2xl mb-3">📋</p>
+                    <p>No open issues</p>
+                </div>`;
+            return;
+        }
+
+        main.innerHTML = projectIssues.map(i => {
+            const labels = (i.labels || []).map(l =>
+                `<span class="px-1.5 py-0.5 rounded text-[10px]" style="background:${l.color ? '#'+l.color+'33' : '#333'};color:${l.color ? '#'+l.color : '#999'}">${escHtml(l.name)}</span>`
+            ).join(' ');
+            return `
+            <div class="card p-4 active:bg-zinc-800 cursor-pointer" onclick="startIssue(${i.number}, '${escHtml(i.title).replace(/'/g,"\\'")}')">
+                <div class="flex items-center justify-between mb-1">
+                    <span class="text-sm font-medium">#${i.number}</span>
+                    <span class="text-xs text-zinc-600">${timeAgo(i.createdAt)}</span>
+                </div>
+                <p class="text-sm text-zinc-300 mb-2">${escHtml(i.title)}</p>
+                <div class="flex gap-1 flex-wrap">${labels}</div>
+            </div>`;
+        }).join('');
+    }
+
+    async function startIssue(number, title) {
+        if (!confirm(`Start agent on #${number}: ${title}?`)) return;
+        await api('/agents/spawn', {
+            method: 'POST',
+            body: {
+                project_id: activeProjectId,
+                issue_number: number,
+                prompt: `Fix issue #${number}: ${title}. Read the issue on GitHub for full context. Implement the fix, run tests, commit and push.`,
+            },
+        });
+        switchView('agents');
     }
 
     function showAddProject() { document.getElementById('add-project-modal').classList.remove('hidden'); }

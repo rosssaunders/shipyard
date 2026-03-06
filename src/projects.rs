@@ -98,10 +98,39 @@ pub async fn get_project(
 }
 
 pub async fn list_issues(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> Json<Vec<serde_json::Value>> {
-    // TODO: fetch from GitHub API via octocrab
-    let _ = id;
-    Json(vec![])
+    // Get project owner/repo from DB
+    let (owner, repo) = {
+        let conn = state.db.conn();
+        match conn.query_row(
+            "SELECT owner, repo FROM projects WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ) {
+            Ok(r) => r,
+            Err(_) => return Json(vec![]),
+        }
+    };
+
+    // Use gh CLI to fetch issues (authenticated already)
+    let output = std::process::Command::new("gh")
+        .args([
+            "issue", "list",
+            "--repo", &format!("{owner}/{repo}"),
+            "--state", "open",
+            "--limit", "50",
+            "--json", "number,title,labels,assignees,state,createdAt,updatedAt,milestone",
+        ])
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => {
+            let json: Vec<serde_json::Value> =
+                serde_json::from_slice(&out.stdout).unwrap_or_default();
+            Json(json)
+        }
+        _ => Json(vec![]),
+    }
 }
