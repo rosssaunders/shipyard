@@ -174,6 +174,14 @@ impl AgentManager {
             .map(|p| p.output.lock().unwrap().clone())
     }
 
+    pub fn get_output_arc(&self, id: &str) -> Option<Arc<Mutex<String>>> {
+        self.processes
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|p| p.output.clone())
+    }
+
     pub fn kill(&self, id: &str) -> bool {
         if let Some(process) = self.processes.lock().unwrap().get(id) {
             process.finished.store(true, std::sync::atomic::Ordering::Relaxed);

@@ -637,6 +637,11 @@ async fn run_task_pipeline(
 
     add_event(&state, task_id, "agent", "🔨", "Agent started working...", None);
 
+    // Start log parser — turns raw output into structured stages
+    if let Some(output) = state.agents.get_output_arc(task_id) {
+        crate::log_parser::spawn_log_parser(state.clone(), task_id.to_string(), output);
+    }
+
     // Poll until agent finishes (with timeout)
     let max_wait = std::time::Duration::from_secs(12 * 3600); // 12 hour max
     let start = std::time::Instant::now();
