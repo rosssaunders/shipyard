@@ -1,6 +1,7 @@
 mod db;
 mod agents;
 mod projects;
+mod tasks;
 mod ws;
 
 use axum::{
@@ -37,7 +38,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/projects/:id", get(projects::get_project))
         .route("/api/projects/:id/issues", get(projects::list_issues))
         .route("/api/projects/:id/agents", get(agents::list_agents))
-        // Agents
+        // Tasks (new task-oriented API)
+        .route("/api/projects/:id/tasks", get(tasks::list_tasks))
+        .route("/api/tasks", post(tasks::create_task))
+        .route("/api/tasks/:id", get(tasks::get_task))
+        .route("/api/tasks/:id/kill", post(tasks::kill_task))
+        // Legacy agents
         .route("/api/agents/spawn", post(agents::spawn_agent))
         .route("/api/agents/:id", get(agents::get_agent))
         .route("/api/agents/:id/kill", post(agents::kill_agent))

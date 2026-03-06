@@ -124,6 +124,10 @@ impl AgentManager {
         Ok(pid)
     }
 
+    pub fn is_running(&self, id: &str) -> bool {
+        self.processes.lock().unwrap().contains_key(id)
+    }
+
     pub fn get_output(&self, id: &str) -> Option<String> {
         self.processes
             .lock()

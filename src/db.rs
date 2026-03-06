@@ -28,9 +28,36 @@ impl Database {
                 config TEXT NOT NULL DEFAULT '{}'
             );
 
-            CREATE TABLE IF NOT EXISTS agents (
+            CREATE TABLE IF NOT EXISTS tasks (
                 id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL REFERENCES projects(id),
+                issue_number INTEGER,
+                title TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                agent_type TEXT NOT NULL DEFAULT 'codex',
+                model TEXT NOT NULL DEFAULT 'gpt-5.4',
+                worktree_path TEXT,
+                branch TEXT,
+                pid INTEGER,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                finished_at TEXT,
+                auto_merge INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS task_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL REFERENCES tasks(id),
+                kind TEXT NOT NULL,
+                icon TEXT NOT NULL DEFAULT '📝',
+                message TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Legacy tables kept for migration compat
+            CREATE TABLE IF NOT EXISTS agents (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
                 issue_number INTEGER,
                 status TEXT NOT NULL DEFAULT 'pending',
                 model TEXT NOT NULL,
@@ -46,16 +73,16 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS quality_gates (
                 id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL REFERENCES agents(id),
+                agent_id TEXT NOT NULL,
                 gate_type TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 output TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            CREATE INDEX IF NOT EXISTS idx_agents_project ON agents(project_id);
-            CREATE INDEX IF NOT EXISTS idx_agents_status ON agents(status);
-            CREATE INDEX IF NOT EXISTS idx_gates_agent ON quality_gates(agent_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id);
             ",
         )?;
         Ok(())

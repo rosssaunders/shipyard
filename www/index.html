@@ -151,18 +151,7 @@
         </div>
     </div>
 
-    <!-- Agent Detail Modal -->
-    <div id="agent-modal" class="fixed inset-0 bg-black/80 hidden z-50 flex flex-col">
-        <div class="flex items-center justify-between px-4 py-3 border-b border-zinc-800">
-            <h2 id="agent-modal-title" class="font-bold">Agent</h2>
-            <button onclick="hideAgentModal()" class="text-zinc-400 hover:text-white text-xl">✕</button>
-        </div>
-        <pre id="agent-logs" class="flex-1 overflow-auto px-4 py-3 text-xs text-green-400 font-mono bg-black"></pre>
-        <div class="border-t border-zinc-800 px-4 py-3 flex gap-2 bottom-safe">
-            <button onclick="killCurrentAgent()" class="bg-red-600/20 text-red-400 border border-red-800 rounded-lg px-4 py-2 text-sm">Kill</button>
-            <button onclick="refreshAgentLogs()" class="bg-zinc-800 rounded-lg px-4 py-2 text-sm flex-1">Refresh Logs</button>
-        </div>
-    </div>
+    <!-- Agent detail modal removed — using inline threaded view -->
 
     <script>
     // --- State ---
@@ -339,18 +328,16 @@
             auto_merge: document.getElementById('gate-merge').checked,
         };
 
-        let prompt = `Fix issue #${dispatchIssue.number}: ${dispatchIssue.title}. Read the issue on GitHub with \`gh issue view ${dispatchIssue.number}\` for full context. Implement the fix, ensure all tests pass, commit and push.`;
-        if (extra) prompt += `\n\nAdditional instructions: ${extra}`;
-
-        await api('/agents/spawn', {
+        await api('/tasks', {
             method: 'POST',
             body: {
                 project_id: activeProjectId,
                 issue_number: dispatchIssue.number,
-                prompt,
+                title: dispatchIssue.title,
                 model,
                 agent_type: dispatchAgent,
                 quality_gates: gates,
+                extra_instructions: extra || undefined,
             },
         });
         hideDispatch();
@@ -369,52 +356,101 @@
         await loadProjects();
     }
 
-    // --- Agents ---
+    // --- Tasks ---
+    let tasksList = {};
+
     async function loadAgents(projectId) {
-        const agentList = await api(`/projects/${projectId}/agents`);
-        agents[projectId] = agentList;
-        renderAgents();
+        // Now loads tasks instead
+        tasksList[projectId] = await api(`/projects/${projectId}/tasks`);
+        renderTasks();
     }
 
-    function renderAgents() {
+    function renderTasks() {
         const main = document.getElementById('main-content');
-        const projectAgents = agents[activeProjectId] || [];
+        const tasks = tasksList[activeProjectId] || [];
 
-        if (projectAgents.length === 0) {
+        if (tasks.length === 0) {
             main.innerHTML = `
                 <div class="text-center text-zinc-500 py-12">
                     <p class="text-2xl mb-3">🔨</p>
-                    <p>No agents running</p>
+                    <p>No tasks yet</p>
                     <p class="text-sm mt-1">Tap an issue to start work</p>
                 </div>`;
             return;
         }
 
-        main.innerHTML = projectAgents.map(a => {
+        main.innerHTML = tasks.map(t => {
             const statusIcon = {
                 running: '⚡', gates: '🔍', done: '✅', failed: '❌', killed: '💀', pending: '⏳'
-            }[a.status] || '❓';
-            const statusLabel = {
-                running: 'Agent working', gates: 'Running quality gates', done: 'Complete',
-                failed: 'Failed', killed: 'Killed', pending: 'Pending'
-            }[a.status] || a.status;
+            }[t.status] || '❓';
+
+            const lastEvent = t.events.length > 0 ? t.events[t.events.length - 1] : null;
+            const isActive = ['running', 'gates'].includes(t.status);
 
             return `
-            <div class="card p-4 active:bg-zinc-800 cursor-pointer" onclick="showAgent('${a.id}')">
-                <div class="flex items-center justify-between mb-2">
-                    <div class="flex items-center gap-2">
-                        <span class="w-2 h-2 rounded-full ${statusColor(a.status)} ${['running','gates'].includes(a.status) ? 'pulse-dot' : ''}"></span>
-                        <span class="text-sm font-medium">${a.issue_number ? '#' + a.issue_number : a.id.slice(0, 8)}</span>
+            <div class="card overflow-hidden" onclick="toggleTask('${t.id}')">
+                <div class="p-4 active:bg-zinc-800 cursor-pointer">
+                    <div class="flex items-center justify-between mb-1">
+                        <div class="flex items-center gap-2">
+                            <span class="w-2 h-2 rounded-full ${statusColor(t.status)} ${isActive ? 'pulse-dot' : ''}"></span>
+                            <span class="text-sm font-medium">${t.issue_number ? '#' + t.issue_number : t.id.slice(0, 8)}</span>
+                        </div>
+                        <span class="text-xs text-zinc-500">${t.agent_type} · ${t.model}</span>
                     </div>
-                    <span class="text-xs text-zinc-500">${a.model}</span>
+                    <p class="text-sm text-zinc-300 mb-1">${escHtml(t.title)}</p>
+                    ${lastEvent ? `<p class="text-xs text-zinc-500">${lastEvent.icon} ${escHtml(lastEvent.message)}</p>` : ''}
                 </div>
-                <p class="text-xs text-zinc-400 line-clamp-2">${escHtml(a.prompt.slice(0, 120))}</p>
-                <div class="flex items-center justify-between mt-2">
-                    <span class="text-xs status-${a.status}">${statusIcon} ${statusLabel}</span>
-                    <span class="text-xs text-zinc-600">${timeAgo(a.created_at)}</span>
+                <div id="task-thread-${t.id}" class="hidden border-t border-zinc-800">
+                    ${renderThread(t)}
                 </div>
             </div>`;
         }).join('');
+    }
+
+    function renderThread(task) {
+        if (task.events.length === 0) {
+            return '<div class="px-4 py-3 text-xs text-zinc-600">Waiting for events...</div>';
+        }
+
+        const events = task.events.map(e => {
+            const hasDetail = e.detail && e.detail.trim().length > 0;
+            return `
+            <div class="flex gap-3 px-4 py-2 ${e.kind === 'error' ? 'bg-red-950/20' : ''}">
+                <div class="text-sm mt-0.5 shrink-0">${e.icon}</div>
+                <div class="min-w-0 flex-1">
+                    <p class="text-xs text-zinc-300">${escHtml(e.message)}</p>
+                    ${hasDetail ? `<button onclick="event.stopPropagation(); toggleDetail(this)" class="text-[10px] text-zinc-600 hover:text-zinc-400 mt-0.5">Show detail ▾</button>
+                    <pre class="hidden text-[10px] text-zinc-600 mt-1 max-h-40 overflow-auto whitespace-pre-wrap">${escHtml(e.detail)}</pre>` : ''}
+                    <span class="text-[10px] text-zinc-700">${timeAgo(e.created_at)}</span>
+                </div>
+            </div>`;
+        }).join('');
+
+        const isActive = ['running', 'gates'].includes(task.status);
+        const actions = isActive
+            ? `<div class="px-4 py-2 border-t border-zinc-800">
+                <button onclick="event.stopPropagation(); killTaskById('${task.id}')" class="text-xs text-red-400 bg-red-950/30 border border-red-900 rounded-lg px-3 py-1.5">Kill task</button>
+               </div>`
+            : '';
+
+        return events + actions;
+    }
+
+    function toggleTask(id) {
+        const el = document.getElementById(`task-thread-${id}`);
+        if (el) el.classList.toggle('hidden');
+    }
+
+    function toggleDetail(btn) {
+        const pre = btn.nextElementSibling;
+        pre.classList.toggle('hidden');
+        btn.textContent = pre.classList.contains('hidden') ? 'Show detail ▾' : 'Hide detail ▴';
+    }
+
+    async function killTaskById(id) {
+        if (!confirm('Kill this task?')) return;
+        await api(`/tasks/${id}/kill`, { method: 'POST' });
+        if (activeProjectId) loadAgents(activeProjectId);
     }
 
     function renderEmpty() {
@@ -426,35 +462,7 @@
             </div>`;
     }
 
-    // --- Agent Detail ---
-    async function showAgent(id) {
-        currentAgentId = id;
-        document.getElementById('agent-modal').classList.remove('hidden');
-        document.getElementById('agent-modal-title').textContent = `Agent ${id.slice(0, 8)}`;
-        await refreshAgentLogs();
-    }
-
-    function hideAgentModal() {
-        document.getElementById('agent-modal').classList.add('hidden');
-        currentAgentId = null;
-    }
-
-    async function refreshAgentLogs() {
-        if (!currentAgentId) return;
-        const res = await fetch(`/api/agents/${currentAgentId}/logs`);
-        const logs = await res.text();
-        const el = document.getElementById('agent-logs');
-        el.textContent = logs || '(waiting for output...)';
-        el.scrollTop = el.scrollHeight;
-    }
-
-    async function killCurrentAgent() {
-        if (!currentAgentId) return;
-        if (!confirm('Kill this agent?')) return;
-        await api(`/agents/${currentAgentId}/kill`, { method: 'POST' });
-        hideAgentModal();
-        loadAgents(activeProjectId);
-    }
+    // Agent detail modal removed — using inline threaded task view
 
     // --- Chat ---
     async function sendCommand() {
