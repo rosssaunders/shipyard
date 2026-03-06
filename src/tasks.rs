@@ -357,12 +357,20 @@ async fn watch_task(
     issue_number: Option<i64>,
     gates: QualityGates,
 ) {
-    // Poll until agent finishes
+    // Poll until agent finishes (with timeout)
+    let max_wait = std::time::Duration::from_secs(12 * 3600); // 12 hour max
+    let start = std::time::Instant::now();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         let still_running = state.agents.is_running(&task_id);
         if !still_running {
             break;
+        }
+        if start.elapsed() > max_wait {
+            add_event(&state, &task_id, "system", "⏰", "Agent timed out after 12 hours", None);
+            state.agents.kill(&task_id);
+            update_task_status(&state, &task_id, "failed");
+            return;
         }
     }
 
