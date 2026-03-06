@@ -86,29 +86,43 @@ impl AgentManager {
             _ => ("codex", vec!["--yolo", "-m", model, "exec", prompt]),
         };
 
-        let mut child = Command::new(cmd)
-            .args(&args)
+        // Use script(1) to capture PTY output — Codex needs a terminal
+        let log_file = format!("/tmp/shipyard/{id}.log");
+        let _ = std::fs::File::create(&log_file);
+
+        // Wrap command in script(1) to allocate a PTY and capture all output
+        let full_cmd = if agent_type == "claude" {
+            format!("claude -p '{}' --dangerously-skip-permissions", prompt.replace('\'', "'\\''"))
+        } else {
+            format!("codex --yolo -m {} exec '{}'", model, prompt.replace('\'', "'\\''"))
+        };
+
+        let mut child = Command::new("script")
+            .args(["-q", "-c", &full_cmd, &log_file])
             .current_dir(workdir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()?;
 
         let pid = child.id().unwrap_or(0);
         let output = Arc::new(Mutex::new(String::new()));
         let output_clone = output.clone();
+        let log_file_clone = log_file.clone();
 
-        // Stream stdout in background
-        let mut stdout = child.stdout.take().unwrap();
+        // Tail the log file in background
         tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
+            let mut last_size = 0u64;
             loop {
-                match stdout.read(&mut buf).await {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&buf[..n]);
-                        output_clone.lock().unwrap().push_str(&text);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                if let Ok(content) = tokio::fs::read_to_string(&log_file_clone).await {
+                    let new_len = content.len() as u64;
+                    if new_len > last_size {
+                        let new_content = &content[last_size as usize..];
+                        // Strip ANSI escape codes for cleaner output
+                        let cleaned = strip_ansi(new_content);
+                        output_clone.lock().unwrap().push_str(&cleaned);
+                        last_size = new_len;
                     }
-                    Err(_) => break,
                 }
             }
         });
@@ -144,6 +158,31 @@ impl AgentManager {
             false
         }
     }
+}
+
+/// Strip ANSI escape sequences for clean terminal output
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip ESC [ ... (letter) sequences
+            if chars.peek() == Some(&'[') {
+                chars.next(); // consume '['
+                while let Some(&nc) = chars.peek() {
+                    chars.next();
+                    if nc.is_ascii_alphabetic() || nc == 'm' || nc == 'H' || nc == 'J' || nc == 'K' {
+                        break;
+                    }
+                }
+            }
+        } else if c == '\r' {
+            // Skip carriage returns
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 // --- HTTP handlers ---
