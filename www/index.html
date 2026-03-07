@@ -631,6 +631,111 @@ header {
   to { transform: translateY(0); opacity: 1; }
 }
 
+/* Right-side pinned feed panel */
+.app-layout {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+}
+.chat-column {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.feed-panel {
+  width: 340px;
+  flex-shrink: 0;
+  border-left: 1px solid var(--border);
+  background: rgba(7, 11, 18, 0.95);
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+}
+.feed-panel-header {
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.feed-panel-header h3 {
+  font-size: 14px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text2);
+}
+.feed-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+  -webkit-overflow-scrolling: touch;
+}
+.feed-panel .event-card {
+  margin-bottom: 8px;
+}
+.feed-panel .empty {
+  padding: 20px 8px;
+  text-align: center;
+}
+.feed-toggle {
+  display: none;
+  position: fixed;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 80px);
+  right: 14px;
+  z-index: 26;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: rgba(14, 21, 33, 0.95);
+  color: var(--text);
+  font-size: 20px;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  backdrop-filter: blur(12px);
+}
+.feed-toggle .feed-count {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  background: var(--accent);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+.feed-mobile-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  background: rgba(0,0,0,0.5);
+  display: none;
+}
+.feed-mobile-panel {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  max-height: 70vh;
+  background: linear-gradient(180deg, #0f1625, #0a101a);
+  border-top: 1px solid var(--border);
+  border-radius: 20px 20px 0 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.feed-mobile-overlay.open {
+  display: block;
+}
+
 @media (min-width: 900px) {
   .chat-shell {
     padding-left: 24px;
@@ -639,6 +744,19 @@ header {
   .composer {
     padding-left: 24px;
     padding-right: 24px;
+  }
+  .feed-panel {
+    display: flex;
+  }
+  .feed-toggle {
+    display: none !important;
+  }
+}
+@media (max-width: 899px) {
+  .feed-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
 }
 </style>
@@ -742,6 +860,8 @@ header {
   <button class="menu-btn" aria-label="Open menu" onclick="toggleMenu(true)">≡</button>
 </header>
 
+<div class="app-layout">
+<div class="chat-column">
 <main id="chat-shell" class="chat-shell">
   <div id="messages" class="messages"></div>
 </main>
@@ -752,6 +872,33 @@ header {
     <button id="send-btn" class="send-btn" type="submit">Send</button>
   </div>
 </form>
+</div><!-- /chat-column -->
+
+<aside class="feed-panel" id="feed-panel">
+  <div class="feed-panel-header">
+    <h3>Tasks</h3>
+    <span id="feed-panel-badge" class="badge">0 active</span>
+  </div>
+  <div class="feed-panel-body" id="feed-panel-body"></div>
+</aside>
+</div><!-- /app-layout -->
+
+<!-- Mobile feed toggle button -->
+<button class="feed-toggle" id="feed-toggle-btn" onclick="toggleMobileFeed(true)">
+  📋
+  <span class="feed-count" id="feed-toggle-count" style="display:none;">0</span>
+</button>
+
+<!-- Mobile feed overlay -->
+<div class="feed-mobile-overlay" id="feed-mobile-overlay" onclick="toggleMobileFeed(false)">
+  <div class="feed-mobile-panel" onclick="event.stopPropagation()">
+    <div class="feed-panel-header">
+      <h3>Tasks</h3>
+      <button class="inline-btn" onclick="toggleMobileFeed(false)">Close</button>
+    </div>
+    <div class="feed-panel-body" id="feed-mobile-body" style="max-height:60vh;"></div>
+  </div>
+</div>
 
 <script>
 const API = "";
@@ -1094,15 +1241,39 @@ async function loadFeed() {
 }
 
 function renderFeed() {
-  const view = document.getElementById("feed-view");
   const project = activeProject();
   const filtered = project
     ? feedEvents.filter((event) => !event.repo || event.repo === project.repo)
     : feedEvents;
 
+  const feedHtml = buildFeedHtml(filtered);
+
+  // Render into sidebar menu (existing)
+  document.getElementById("feed-view").innerHTML = feedHtml;
+  // Render into pinned desktop panel
+  document.getElementById("feed-panel-body").innerHTML = feedHtml;
+  // Render into mobile overlay
+  document.getElementById("feed-mobile-body").innerHTML = feedHtml;
+
+  // Update badge counts
+  const activeCount = summarizeRunningTasks(feedEvents);
+  const panelBadge = document.getElementById("feed-panel-badge");
+  if (panelBadge) panelBadge.textContent = `${activeCount} active`;
+
+  const toggleCount = document.getElementById("feed-toggle-count");
+  if (toggleCount) {
+    if (activeCount > 0) {
+      toggleCount.textContent = activeCount;
+      toggleCount.style.display = "flex";
+    } else {
+      toggleCount.style.display = "none";
+    }
+  }
+}
+
+function buildFeedHtml(filtered) {
   if (!filtered.length) {
-    view.innerHTML = `<div class="empty">No task activity yet.</div>`;
-    return;
+    return `<div class="empty">No task activity yet.</div>`;
   }
 
   const tasks = {};
@@ -1122,7 +1293,7 @@ function renderFeed() {
     }
   });
 
-  view.innerHTML = Object.values(tasks).map((task) => {
+  return Object.values(tasks).map((task) => {
     const latest = task.events[0];
     const detail = task.events.slice(0, 5).map((event) => `${event.icon} ${event.message}`).join("\n");
     return `
@@ -1143,6 +1314,10 @@ function renderFeed() {
       </div>
     `;
   }).join("");
+}
+
+function toggleMobileFeed(open) {
+  document.getElementById("feed-mobile-overlay").classList.toggle("open", open);
 }
 
 async function loadBacklog() {
