@@ -1,288 +1,232 @@
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use tracing::warn;
 
-/// The brain's planning output for a task
+use crate::recon::ReconReport;
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TaskPlan {
-    /// Whether this should be split into subtasks
-    pub subtasks: Vec<Subtask>,
-    /// Overall assessment
     pub assessment: String,
-    /// Estimated complexity (1-5)
     pub complexity: u8,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct Subtask {
-    pub title: String,
     pub prompt: String,
-    pub depends_on: Option<String>, // subtask title it depends on
+    pub skip_reason: Option<String>,
+    pub timeout_secs: u64,
 }
 
-/// The brain's review of an agent's work
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ReviewResult {
     pub approved: bool,
     pub summary: String,
     pub issues: Vec<String>,
-    pub suggestion: Option<String>, // if rejected, what to try next
+    pub suggestion: Option<String>,
 }
 
-/// Plan a task: read issue context, understand codebase, craft agent prompt(s)
 pub async fn plan_task(
-    owner: &str,
-    repo: &str,
-    issue_number: Option<i64>,
-    title: &str,
-    extra_instructions: Option<&str>,
+    recon: &ReconReport,
+    knowledge: &str,
     model: &str,
-    project_context: Option<&str>,
 ) -> Result<TaskPlan> {
-    // 1. Gather context
-    let issue_body = if let Some(num) = issue_number {
-        fetch_issue_body(owner, repo, num).await
-    } else {
-        String::new()
-    };
+    let recon_json = serde_json::to_string_pretty(recon)
+        .context("failed to serialize recon report")?;
 
-    let repo_structure = fetch_repo_structure(owner, repo).await;
-
-    // 2. Ask the brain to plan
     let system_prompt = format!(
-        r#"You are an expert software engineering lead. You plan work for coding agents (Codex, Claude Code).
+        r#"You are Shipyard Brain V2, an AI engineering manager that plans work for coding agents.
+
+You will receive:
+- A full recon report gathered before planning
+- Project knowledge and recent task history
 
 Your job:
-1. Read the issue and understand what needs to be done
-2. Assess complexity (1=trivial fix, 5=architecture rewrite)
-3. If complexity >= 4, break into ordered subtasks with dependencies
-4. Write detailed prompts for each subtask/task that include:
-   - Specific files to read/modify
-   - Architecture constraints and patterns to follow
-   - Test commands to verify
-   - What NOT to do (common pitfalls)
-   - Commit message format
+1. Decide whether the task should be skipped because it is already fixed, already in flight, or lacks enough context.
+2. Write one concrete execution prompt for a coding agent.
+3. The prompt must reference specific file paths from recon, exact test commands, and likely gotchas.
+4. Use the recon report directly. Do not ask the coding agent to repeat recon unless information is missing.
+5. If recon suggests the issue may already be fixed, set `skip_reason`.
+6. Choose a realistic timeout in seconds.
 
-{project_context}
+Planning input:
+## Recon Report
+{recon_json}
 
-Respond in JSON format:
+## Project Knowledge And Recent Task History
+{knowledge}
+
+Return JSON only with this schema:
 {{
-  "assessment": "brief assessment of the task",
-  "complexity": 1-5,
-  "subtasks": [
-    {{
-      "title": "short title",
-      "prompt": "detailed multi-paragraph prompt for the coding agent",
-      "depends_on": null or "title of dependency"
-    }}
-  ]
+  "assessment": "short task assessment",
+  "complexity": 1,
+  "prompt": "specific execution prompt for one coding agent",
+  "skip_reason": null,
+  "timeout_secs": 3600
 }}
 
-For simple tasks (complexity 1-3), return a single subtask.
-For complex tasks (complexity 4-5), break into 2-5 subtasks with clear boundaries."#,
-        project_context = project_context.unwrap_or("No project-specific context provided.")
+Rules for `prompt`:
+- Name the files or directories to inspect first.
+- Include the exact verification commands.
+- Mention branch/PR context if relevant.
+- Mention concrete gotchas from knowledge or recon.
+- Keep it actionable and repo-specific.
+"#
     );
 
-    let user_prompt = format!(
-        "## Issue\n**{title}**\n\n{issue_body}\n\n## Repository structure\n{repo_structure}\n\n{}",
-        extra_instructions.map(|e| format!("## Additional instructions\n{e}")).unwrap_or_default()
-    );
-
-    let response = call_llm(model, &system_prompt, &user_prompt).await?;
-
-    // Parse the JSON response
-    let plan: TaskPlan = parse_plan_response(&response)?;
+    let response = call_llm_json(model, &system_prompt, "Plan the task.").await?;
+    let mut plan: TaskPlan = parse_json_response(&response)?;
+    plan.complexity = plan.complexity.clamp(1, 5);
+    if plan.timeout_secs == 0 {
+        plan.timeout_secs = 3600;
+    }
     Ok(plan)
 }
 
-/// Review an agent's diff output
 pub async fn review_diff(
     diff: &str,
-    original_prompt: &str,
+    recon: &ReconReport,
+    knowledge: &str,
     model: &str,
-    project_context: Option<&str>,
 ) -> Result<ReviewResult> {
+    let recon_json = serde_json::to_string_pretty(recon)
+        .context("failed to serialize recon report")?;
+
     let system_prompt = format!(
-        r#"You are a senior code reviewer. Review this diff produced by a coding agent.
+        r#"You are Shipyard Brain V2 acting as a reviewer.
 
-Check for:
-1. Does it actually solve the stated task?
-2. Are there any regressions or bugs introduced?
-3. Does it follow the project's patterns and conventions?
-4. Are there WASM compatibility issues (e.g., using tokio in WASM)?
-5. Are there missing test cases?
-6. Is the code quality acceptable (no hacks, proper error handling)?
+Review the diff against:
+- The recon report
+- Project knowledge and recent task history
 
-{project_context}
+Check:
+1. Does the diff address the issue described in recon?
+2. Does it introduce regressions or miss obvious edge cases?
+3. Are tests or validation steps missing?
+4. Does it violate project-specific gotchas or patterns?
 
-Respond in JSON:
+## Recon Report
+{recon_json}
+
+## Project Knowledge And Recent Task History
+{knowledge}
+
+Return JSON only:
 {{
-  "approved": true/false,
-  "summary": "one-line summary",
-  "issues": ["list of issues found"],
-  "suggestion": "if rejected, what should be changed"
-}}"#,
-        project_context = project_context.unwrap_or("")
+  "approved": true,
+  "summary": "short summary",
+  "issues": ["issue"],
+  "suggestion": "optional next step"
+}}
+"#
     );
+
+    let user_prompt = format!("Review this diff:\n```diff\n{diff}\n```");
+    let response = call_llm_json(model, &system_prompt, &user_prompt).await?;
+    parse_json_response(&response)
+}
+
+pub async fn extract_learnings(
+    task_id: &str,
+    outcome: &str,
+    diff: &str,
+    model: &str,
+) -> Result<String> {
+    let system_prompt = r#"You extract durable project learnings for future coding agents.
+
+Return concise markdown only. Focus on:
+- validated repo-specific patterns
+- failure modes and how to avoid them
+- useful test or verification commands
+
+If there is nothing durable to save, return an empty string."#;
 
     let user_prompt = format!(
-        "## Original task\n{original_prompt}\n\n## Diff\n```\n{diff}\n```"
+        "Task ID: {task_id}\nOutcome: {outcome}\n\nDiff:\n```diff\n{diff}\n```"
     );
 
-    let response = call_llm(model, &system_prompt, &user_prompt).await?;
-    let review: ReviewResult = serde_json::from_str(&response)
-        .unwrap_or(ReviewResult {
-            approved: true,
-            summary: "Review completed".to_string(),
-            issues: vec![],
-            suggestion: None,
-        });
-    Ok(review)
+    let response = call_llm(model, system_prompt, &user_prompt, None).await?;
+    Ok(response.trim().to_string())
 }
 
-// --- Helpers ---
-
-async fn fetch_issue_body(owner: &str, repo: &str, number: i64) -> String {
-    let output = tokio::process::Command::new("gh")
-        .args([
-            "issue", "view",
-            &number.to_string(),
-            "--repo", &format!("{owner}/{repo}"),
-            "--json", "body,comments",
-        ])
-        .output()
-        .await;
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let json: serde_json::Value =
-                serde_json::from_slice(&out.stdout).unwrap_or_default();
-            let body = json["body"].as_str().unwrap_or("").to_string();
-            let comments = json["comments"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|c| c["body"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n---\n")
-                })
-                .unwrap_or_default();
-            if comments.is_empty() {
-                body
-            } else {
-                format!("{body}\n\n## Comments\n{comments}")
-            }
-        }
-        _ => String::new(),
-    }
-}
-
-async fn fetch_repo_structure(owner: &str, repo: &str) -> String {
-    let repo_path = format!(
-        "{}/code/{}/{}",
-        std::env::var("HOME").unwrap_or_default(),
-        owner,
-        repo
-    );
-
-    let output = tokio::process::Command::new("find")
-        .args([&repo_path, "-name", "*.rs", "-not", "-path", "*/target/*", "-not", "-path", "*/.git/*"])
-        .output()
-        .await;
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let files = String::from_utf8_lossy(&out.stdout);
-            let trimmed: Vec<&str> = files
-                .lines()
-                .map(|l| l.strip_prefix(&repo_path).unwrap_or(l))
-                .take(100)
-                .collect();
-            trimmed.join("\n")
-        }
-        _ => "(could not read repo structure)".to_string(),
-    }
-}
-
-/// Public wrapper for LLM calls from other modules
 pub async fn call_llm_pub(model: &str, system: &str, user: &str) -> Result<String> {
-    call_llm(model, system, user).await
+    call_llm(model, system, user, None).await
 }
 
-async fn call_llm(model: &str, system: &str, user: &str) -> Result<String> {
-    // Use OpenAI-compatible API
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-        .unwrap_or_default();
+async fn call_llm_json(model: &str, system: &str, user: &str) -> Result<String> {
+    call_llm(
+        model,
+        system,
+        user,
+        Some(json!({ "type": "json_object" })),
+    )
+    .await
+}
 
-    let (url, body) = if model.contains("claude") {
-        // Anthropic API
-        (
-            "https://api.anthropic.com/v1/messages".to_string(),
-            serde_json::json!({
-                "model": model,
-                "max_tokens": 4096,
-                "system": system,
-                "messages": [{"role": "user", "content": user}]
-            }),
-        )
-    } else {
-        // OpenAI API
-        (
-            "https://api.openai.com/v1/chat/completions".to_string(),
-            serde_json::json!({
-                "model": model,
-                "max_completion_tokens": 4096,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user}
-                ]
-            }),
-        )
-    };
+async fn call_llm(
+    model: &str,
+    system: &str,
+    user: &str,
+    response_format: Option<serde_json::Value>,
+) -> Result<String> {
+    let endpoint = llm_endpoint();
+    let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
+    let model = resolved_model(model);
+    let api_key = std::env::var("SHIPYARD_API_KEY").unwrap_or_default();
+
+    let mut body = json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ]
+    });
+
+    if let Some(format) = response_format {
+        body["response_format"] = format;
+    }
 
     let client = reqwest::Client::new();
-    let mut req = client
+    let mut request = client
         .post(&url)
         .header("Content-Type", "application/json");
 
-    if model.contains("claude") {
-        req = req
-            .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01");
-    } else {
-        req = req.header("Authorization", format!("Bearer {api_key}"));
+    if !api_key.is_empty() {
+        request = request.header("Authorization", format!("Bearer {api_key}"));
     }
 
-    let resp = req.json(&body).send().await?;
-    let json: serde_json::Value = resp.json().await?;
+    let response = request
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("failed to call LLM endpoint {url}"))?;
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
 
-    // Extract content based on API format
-    let content = if model.contains("claude") {
-        json["content"][0]["text"]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
-    } else {
-        json["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
-    };
+    if !status.is_success() {
+        return Err(anyhow!("LLM request failed with status {status}: {text}"));
+    }
 
-    Ok(content)
+    let json: serde_json::Value =
+        serde_json::from_str(&text).context("failed to parse LLM response body")?;
+
+    extract_message_content(&json).ok_or_else(|| {
+        warn!(response = %text, "LLM response missing message content");
+        anyhow!("LLM response did not contain message content")
+    })
 }
 
-fn parse_plan_response(response: &str) -> Result<TaskPlan> {
-    // Strip markdown code fences if present
+fn parse_json_response<T>(response: &str) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
     let cleaned = response
         .trim()
-        .strip_prefix("```json").unwrap_or(response)
-        .strip_prefix("```").unwrap_or(response)
-        .strip_suffix("```").unwrap_or(response)
+        .strip_prefix("```json")
+        .or_else(|| response.trim().strip_prefix("```"))
+        .unwrap_or(response)
+        .trim()
+        .strip_suffix("```")
+        .unwrap_or(response)
         .trim();
 
-    // Try to extract JSON from the response
-    let json_str = if let Some(start) = cleaned.find('{') {
+    let candidate = if let Some(start) = cleaned.find('{') {
         if let Some(end) = cleaned.rfind('}') {
             &cleaned[start..=end]
         } else {
@@ -292,18 +236,34 @@ fn parse_plan_response(response: &str) -> Result<TaskPlan> {
         cleaned
     };
 
-    let plan: TaskPlan = serde_json::from_str(json_str).unwrap_or_else(|_| {
-        // Fallback: treat the whole response as a single-task prompt
-        TaskPlan {
-            assessment: "Could not parse structured plan".to_string(),
-            complexity: 3,
-            subtasks: vec![Subtask {
-                title: "Implementation".to_string(),
-                prompt: response.to_string(),
-                depends_on: None,
-            }],
-        }
-    });
+    serde_json::from_str(candidate).context("failed to parse structured LLM JSON response")
+}
 
-    Ok(plan)
+fn extract_message_content(value: &serde_json::Value) -> Option<String> {
+    let content = &value["choices"][0]["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+
+    content.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|item| item["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+fn llm_endpoint() -> String {
+    std::env::var("SHIPYARD_LLM_ENDPOINT")
+        .unwrap_or_else(|_| "http://localhost:3000/v1".to_string())
+}
+
+fn resolved_model(model: &str) -> String {
+    if model.trim().is_empty() {
+        std::env::var("SHIPYARD_LLM_MODEL")
+            .unwrap_or_else(|_| "claude-sonnet-4.5".to_string())
+    } else {
+        model.to_string()
+    }
 }
