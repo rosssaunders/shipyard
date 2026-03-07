@@ -15,7 +15,7 @@ impl Config {
             llm_endpoint: std::env::var("SHIPYARD_LLM_ENDPOINT")
                 .unwrap_or_else(|_| "http://localhost:3000/v1".to_string()),
             llm_model: std::env::var("SHIPYARD_LLM_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4.5".to_string()),
+                .unwrap_or_else(|_| "gpt-5.4".to_string()),
             api_key: std::env::var("SHIPYARD_API_KEY").unwrap_or_default(),
             data_dir: std::env::var("SHIPYARD_DATA_DIR")
                 .map(PathBuf::from)

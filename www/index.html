@@ -632,6 +632,7 @@ header {
 }
 
 /* Right-side pinned feed panel */
+/* Three-column layout: backlog | chat | feed */
 .app-layout {
   flex: 1;
   display: flex;
@@ -643,6 +644,16 @@ header {
   display: flex;
   flex-direction: column;
   min-width: 0;
+}
+.backlog-panel {
+  width: 300px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  background: rgba(7, 11, 18, 0.95);
+  display: none;
+  flex-direction: column;
+  overflow: hidden;
+  order: -1;
 }
 .feed-panel {
   width: 340px;
@@ -735,6 +746,64 @@ header {
 .feed-mobile-overlay.open {
   display: block;
 }
+.backlog-toggle {
+  display: none;
+  position: fixed;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 80px);
+  left: 14px;
+  z-index: 26;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: rgba(14, 21, 33, 0.95);
+  color: var(--text);
+  font-size: 20px;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  backdrop-filter: blur(12px);
+  align-items: center;
+  justify-content: center;
+}
+.backlog-toggle .backlog-count {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  min-width: 18px;
+  height: 18px;
+  border-radius: 9px;
+  background: var(--orange);
+  color: white;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+.backlog-mobile-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 55;
+  background: rgba(0,0,0,0.5);
+  display: none;
+}
+.backlog-mobile-panel {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  max-height: 70vh;
+  background: linear-gradient(180deg, #0f1625, #0a101a);
+  border-top: 1px solid var(--border);
+  border-radius: 20px 20px 0 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.backlog-mobile-overlay.open {
+  display: block;
+}
 
 @media (min-width: 900px) {
   .chat-shell {
@@ -748,7 +817,13 @@ header {
   .feed-panel {
     display: flex;
   }
+  .backlog-panel {
+    display: flex;
+  }
   .feed-toggle {
+    display: none !important;
+  }
+  .backlog-toggle {
     display: none !important;
   }
 }
@@ -757,6 +832,9 @@ header {
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+  .backlog-toggle {
+    display: flex;
   }
 }
 </style>
@@ -861,6 +939,13 @@ header {
 </header>
 
 <div class="app-layout">
+<aside class="backlog-panel" id="backlog-panel">
+  <div class="feed-panel-header">
+    <h3>Backlog</h3>
+    <span id="backlog-panel-badge" class="badge">0 issues</span>
+  </div>
+  <div class="feed-panel-body" id="backlog-panel-body"></div>
+</aside>
 <div class="chat-column">
 <main id="chat-shell" class="chat-shell">
   <div id="messages" class="messages"></div>
@@ -882,6 +967,23 @@ header {
   <div class="feed-panel-body" id="feed-panel-body"></div>
 </aside>
 </div><!-- /app-layout -->
+
+<!-- Mobile backlog toggle button -->
+<button class="backlog-toggle" id="backlog-toggle-btn" onclick="toggleMobileBacklog(true)">
+  📋
+  <span class="backlog-count" id="backlog-toggle-count" style="display:none;">0</span>
+</button>
+
+<!-- Mobile backlog overlay -->
+<div class="backlog-mobile-overlay" id="backlog-mobile-overlay" onclick="toggleMobileBacklog(false)">
+  <div class="backlog-mobile-panel" onclick="event.stopPropagation()">
+    <div class="feed-panel-header">
+      <h3>Backlog</h3>
+      <button class="inline-btn" onclick="toggleMobileBacklog(false)">Close</button>
+    </div>
+    <div class="feed-panel-body" id="backlog-mobile-body" style="max-height:60vh;"></div>
+  </div>
+</div>
 
 <!-- Mobile feed toggle button -->
 <button class="feed-toggle" id="feed-toggle-btn" onclick="toggleMobileFeed(true)">
@@ -1320,6 +1422,10 @@ function toggleMobileFeed(open) {
   document.getElementById("feed-mobile-overlay").classList.toggle("open", open);
 }
 
+function toggleMobileBacklog(open) {
+  document.getElementById("backlog-mobile-overlay").classList.toggle("open", open);
+}
+
 async function loadBacklog() {
   const project = activeProject();
   const view = document.getElementById("backlog-view");
@@ -1334,18 +1440,38 @@ async function loadBacklog() {
 }
 
 function renderBacklog() {
-  const view = document.getElementById("backlog-view");
   const project = activeProject();
+  const backlogHtml = buildBacklogHtml(project);
+
+  // Render into sidebar menu, pinned panel, and mobile overlay
+  document.getElementById("backlog-view").innerHTML = backlogHtml;
+  document.getElementById("backlog-panel-body").innerHTML = backlogHtml;
+  document.getElementById("backlog-mobile-body").innerHTML = backlogHtml;
+
+  // Update badge
+  const panelBadge = document.getElementById("backlog-panel-badge");
+  if (panelBadge) panelBadge.textContent = `${backlogIssues.length} issues`;
+
+  const toggleCount = document.getElementById("backlog-toggle-count");
+  if (toggleCount) {
+    if (backlogIssues.length > 0) {
+      toggleCount.textContent = backlogIssues.length;
+      toggleCount.style.display = "flex";
+    } else {
+      toggleCount.style.display = "none";
+    }
+  }
+}
+
+function buildBacklogHtml(project) {
   if (!project) {
-    view.innerHTML = `<div class="empty">No active project.</div>`;
-    return;
+    return `<div class="empty">No active project.</div>`;
   }
   if (!backlogIssues.length) {
-    view.innerHTML = `<div class="empty">No open issues.</div>`;
-    return;
+    return `<div class="empty">No open issues.</div>`;
   }
 
-  view.innerHTML = backlogIssues.map((issue) => {
+  return backlogIssues.map((issue) => {
     const launched = launchedIssues.has(issue.number);
     return `
       <div class="issue-card">
