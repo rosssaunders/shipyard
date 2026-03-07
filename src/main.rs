@@ -1,3 +1,4 @@
+mod config;
 mod db;
 mod agents;
 mod brain;
@@ -17,9 +18,12 @@ use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
 
+use crate::config::Config;
+
 pub struct AppState {
     pub db: db::Database,
     pub agents: agents::AgentManager,
+    pub config: Config,
 }
 
 #[tokio::main]
@@ -28,12 +32,15 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
+    let config = Config::from_env();
     let db = db::Database::open("shipyard.db")?;
     db.migrate()?;
+    let _ = std::fs::create_dir_all(&config.data_dir);
 
     let state = Arc::new(AppState {
         db,
         agents: agents::AgentManager::new(),
+        config: config.clone(),
     });
 
     let api = Router::new()
@@ -70,11 +77,11 @@ async fn main() -> anyhow::Result<()> {
     let app = api
         .fallback_service(ServeDir::new("www"));
 
-    let addr = "0.0.0.0:3000";
+    let addr = format!("0.0.0.0:{}", config.port);
     tracing::info!("⚓ Shipyard listening on {addr}");
-    tracing::info!("  Open on phone: http://localhost:3000");
+    tracing::info!("  Open on phone: http://localhost:{}", config.port);
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())

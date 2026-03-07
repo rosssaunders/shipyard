@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::AppState;
 use crate::agents::QualityGates;
+use crate::knowledge::{KnowledgeStore, TaskRecord};
 
 // --- Intent-driven API ---
 
@@ -71,7 +72,7 @@ pub async fn submit_intent(
 
     // Brain interprets the intent → creates a task
     let id = uuid::Uuid::new_v4().to_string();
-    let model = "gpt-5.4".to_string();
+    let model = state.config.llm_model.clone();
     let agent_type = "codex".to_string();
     let now = chrono::Utc::now().to_rfc3339();
     let worktree_path = format!("/tmp/shipyard/{}/{}", repo, &id[..8]);
@@ -261,7 +262,7 @@ pub fn add_event(state: &AppState, task_id: &str, kind: &str, icon: &str, messag
 }
 
 pub fn update_task_status(state: &AppState, task_id: &str, status: &str) {
-    let finished = if matches!(status, "done" | "failed" | "killed") {
+    let finished = if matches!(status, "done" | "failed" | "killed" | "skipped") {
         Some("datetime('now')")
     } else {
         None
@@ -400,7 +401,7 @@ pub async fn create_task(
     Json(req): Json<CreateTaskRequest>,
 ) -> Json<Task> {
     let id = uuid::Uuid::new_v4().to_string();
-    let model = req.model.unwrap_or_else(|| "gpt-5.4".to_string());
+    let model = req.model.unwrap_or_else(|| state.config.llm_model.clone());
     let agent_type = req.agent_type.unwrap_or_else(|| "codex".to_string());
     let gates = req.quality_gates.unwrap_or_default();
     let now = chrono::Utc::now().to_rfc3339();
@@ -561,62 +562,102 @@ async fn run_task_pipeline(
 ) {
     let task_id = &id;
     let worktree = &worktree_path;
+    let repo_path = repo_checkout_path(&owner, &repo);
+    let knowledge_store = KnowledgeStore::new();
 
-    // Brain planning phase
-    add_event(&state, task_id, "brain", "🧠", "Brain is analyzing the task...", None);
+    add_event(&state, task_id, "recon", "🔍", "Recon: gathering repo and issue context...", None);
+    let recon = crate::recon::run_recon(&owner, &repo, issue_number, &repo_path).await;
+    add_event(
+        &state,
+        task_id,
+        "recon",
+        "🔍",
+        "Recon complete",
+        Some(&format_recon_detail(&recon)),
+    );
 
-    // Load project skills for context
     let project_skills = {
         let conn = state.db.conn();
         conn.query_row(
             "SELECT skills FROM projects p JOIN tasks t ON t.project_id = p.id WHERE t.id = ?1",
             [task_id],
             |r| r.get::<_, String>(0),
-        ).unwrap_or_default()
+        )
+        .unwrap_or_default()
     };
-    let skills_context = if project_skills.is_empty() {
-        None
-    } else {
-        Some(format!("## Project Knowledge (Skills)\n{project_skills}"))
-    };
-
-    let plan = crate::brain::plan_task(
-        &owner,
-        &repo,
-        issue_number,
-        &title,
+    let persistent_knowledge = knowledge_store.load_knowledge(&owner, &repo);
+    let recent_history = knowledge_store.recent_history(&owner, &repo, 8);
+    let planning_knowledge = build_planning_knowledge(
+        &project_skills,
+        &persistent_knowledge,
+        &recent_history,
         extra_instructions.as_deref(),
-        &model,
-        skills_context.as_deref(),
-    )
-    .await;
+    );
+
+    add_event(&state, task_id, "brain", "🧠", "Brain: planning from recon report...", None);
+
+    let plan = crate::brain::plan_task(&recon, &planning_knowledge, &model).await;
+    let mut max_wait = std::time::Duration::from_secs(12 * 3600);
 
     let prompt = match &plan {
         Ok(plan) => {
-            add_event(&state, task_id, "brain", "🧠",
+            add_event(
+                &state,
+                task_id,
+                "brain",
+                "🧠",
                 &format!("Complexity: {}/5 — {}", plan.complexity, plan.assessment),
-                None);
+                Some(&format!("Timeout: {}s", plan.timeout_secs)),
+            );
 
-            if plan.subtasks.len() > 1 {
-                add_event(&state, task_id, "brain", "🧠",
-                    &format!("Breaking into {} subtasks", plan.subtasks.len()),
-                    Some(&plan.subtasks.iter().map(|s| format!("• {}", s.title)).collect::<Vec<_>>().join("\n")));
+            if let Some(skip_reason) = &plan.skip_reason {
+                add_event(
+                    &state,
+                    task_id,
+                    "brain",
+                    "🧠",
+                    "Brain: skipping task",
+                    Some(skip_reason),
+                );
+                update_task_status(&state, task_id, "skipped");
+                persist_task_outcome(
+                    &knowledge_store,
+                    &state,
+                    &owner,
+                    &repo,
+                    task_id,
+                    &title,
+                    issue_number,
+                    worktree,
+                    "skipped",
+                    skip_reason,
+                    &model,
+                    false,
+                )
+                .await;
+                return;
             }
 
-            plan.subtasks.iter().map(|s| s.prompt.as_str()).collect::<Vec<_>>().join("\n\n---\n\n")
+            if plan.timeout_secs > 0 {
+                max_wait = std::time::Duration::from_secs(plan.timeout_secs.max(300));
+            }
+
+            if plan.prompt.trim().is_empty() {
+                fallback_prompt(&title, issue_number, extra_instructions.as_deref())
+            } else {
+                plan.prompt.clone()
+            }
         }
         Err(e) => {
-            add_event(&state, task_id, "brain", "⚠️",
-                &format!("Brain planning failed, using basic prompt: {e}"), None);
-            let mut p = if let Some(issue_num) = issue_number {
-                format!("Fix issue #{issue_num}: {title}. Run `gh issue view {issue_num}` for full context. Implement the fix, ensure all tests pass, commit and push.")
-            } else {
-                title.clone()
-            };
-            if let Some(extra) = &extra_instructions {
-                p.push_str(&format!("\n\nAdditional instructions: {extra}"));
-            }
-            p
+            add_event(
+                &state,
+                task_id,
+                "brain",
+                "⚠️",
+                &format!("Brain planning failed, using fallback prompt: {e}"),
+                None,
+            );
+            fallback_prompt(&title, issue_number, extra_instructions.as_deref())
         }
     };
 
@@ -643,7 +684,6 @@ async fn run_task_pipeline(
     }
 
     // Poll until agent finishes (with timeout)
-    let max_wait = std::time::Duration::from_secs(12 * 3600); // 12 hour max
     let start = std::time::Instant::now();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -652,9 +692,31 @@ async fn run_task_pipeline(
             break;
         }
         if start.elapsed() > max_wait {
-            add_event(&state, &task_id, "system", "⏰", "Agent timed out after 12 hours", None);
+            add_event(
+                &state,
+                &task_id,
+                "system",
+                "⏰",
+                &format!("Agent timed out after {} seconds", max_wait.as_secs()),
+                None,
+            );
             state.agents.kill(&task_id);
             update_task_status(&state, &task_id, "failed");
+            persist_task_outcome(
+                &knowledge_store,
+                &state,
+                &owner,
+                &repo,
+                task_id,
+                &title,
+                issue_number,
+                worktree,
+                "failed",
+                "Agent timed out",
+                &model,
+                true,
+            )
+            .await;
             return;
         }
     }
@@ -676,7 +738,21 @@ async fn run_task_pipeline(
     if !has_commits.0 || has_commits.1.trim().is_empty() {
         add_event(&state, &task_id, "error", "⚠️", "No commits produced by agent", None);
         update_task_status(&state, &task_id, "failed");
-        learn_from_task(&state, &task_id, &title, &model).await;
+        persist_task_outcome(
+            &knowledge_store,
+            &state,
+            &owner,
+            &repo,
+            task_id,
+            &title,
+            issue_number,
+            worktree,
+            "failed",
+            "No commits produced by agent",
+            &model,
+            true,
+        )
+        .await;
         return;
     }
 
@@ -686,7 +762,7 @@ async fn run_task_pipeline(
 
     // Run quality gates from project skills (Layer 1: Supervisor)
     let mut attempt = 0u32;
-    let mut all_passed = loop {
+    let all_passed = loop {
         attempt += 1;
         let results = crate::supervisor::run_skill_gates(&state, &task_id, worktree).await;
         let failures: Vec<_> = results.iter().filter(|r| !r.passed).collect();
@@ -723,8 +799,87 @@ async fn run_task_pipeline(
     if !all_passed {
         update_task_status(&state, &task_id, "failed");
         add_event(&state, &task_id, "supervisor", "❌", "Supervisor: gates failed after all fix attempts", None);
-        learn_from_task(&state, &task_id, &title, &model).await;
+        persist_task_outcome(
+            &knowledge_store,
+            &state,
+            &owner,
+            &repo,
+            task_id,
+            &title,
+            issue_number,
+            worktree,
+            "failed",
+            "Supervisor gates failed after all fix attempts",
+            &model,
+            true,
+        )
+        .await;
         return;
+    }
+
+    if gates.review {
+        add_event(&state, &task_id, "review", "🧠", "Brain: reviewing diff...", None);
+        let diff = capture_task_diff(worktree);
+        if diff.trim().is_empty() {
+            add_event(
+                &state,
+                &task_id,
+                "review",
+                "⚠️",
+                "Brain review skipped because diff was empty",
+                None,
+            );
+        } else {
+            match crate::brain::review_diff(&diff, &recon, &planning_knowledge, &model).await {
+                Ok(review) if review.approved => {
+                    let detail = if review.issues.is_empty() {
+                        review.summary.clone()
+                    } else {
+                        format!("{}\n\n{}", review.summary, review.issues.join("\n"))
+                    };
+                    add_event(&state, &task_id, "review", "✅", "Brain review approved", Some(&detail));
+                }
+                Ok(review) => {
+                    let mut detail = review.summary;
+                    if !review.issues.is_empty() {
+                        detail.push_str("\n\nIssues:\n");
+                        detail.push_str(&review.issues.join("\n"));
+                    }
+                    if let Some(suggestion) = review.suggestion {
+                        detail.push_str("\n\nSuggestion:\n");
+                        detail.push_str(&suggestion);
+                    }
+                    add_event(&state, &task_id, "review", "❌", "Brain review rejected the diff", Some(&detail));
+                    update_task_status(&state, &task_id, "failed");
+                    persist_task_outcome(
+                        &knowledge_store,
+                        &state,
+                        &owner,
+                        &repo,
+                        task_id,
+                        &title,
+                        issue_number,
+                        worktree,
+                        "failed",
+                        "Brain review rejected the diff",
+                        &model,
+                        true,
+                    )
+                    .await;
+                    return;
+                }
+                Err(e) => {
+                    add_event(
+                        &state,
+                        &task_id,
+                        "review",
+                        "⚠️",
+                        &format!("Brain review failed, continuing: {e}"),
+                        None,
+                    );
+                }
+            }
+        }
     }
 
     // Push and create PR
@@ -733,6 +888,21 @@ async fn run_task_pipeline(
     if !push.0 {
         add_event(&state, &task_id, "error", "❌", "Failed to push branch", Some(&push.1));
         update_task_status(&state, &task_id, "failed");
+        persist_task_outcome(
+            &knowledge_store,
+            &state,
+            &owner,
+            &repo,
+            task_id,
+            &title,
+            issue_number,
+            worktree,
+            "failed",
+            "Failed to push branch",
+            &model,
+            true,
+        )
+        .await;
         return;
     }
 
@@ -759,75 +929,6 @@ async fn run_task_pipeline(
         add_event(&state, &task_id, "error", "⚠️", "Failed to create PR", Some(&pr.1));
     }
 
-    // Dispatch reviewer agent
-    if gates.review {
-        add_event(&state, &task_id, "brain", "🧠", "Dispatching reviewer agent...", None);
-
-        let review_prompt = format!(
-            "You are a code reviewer. Review the changes on this branch vs main.\n\n\
-            Run: git diff main...HEAD\n\n\
-            Check for:\n\
-            1. Does it solve the stated task?\n\
-            2. Any bugs or regressions?\n\
-            3. WASM compatibility (no tokio, no std::fs in WASM paths)?\n\
-            4. Missing tests?\n\
-            5. Code quality?\n\n\
-            Run the tests: cargo test\n\n\
-            At the end, create a file called REVIEW.md with:\n\
-            - approved: true/false\n\
-            - summary: one line\n\
-            - issues: list any problems found\n\n\
-            If approved, write 'approved: true' on the first line.\n\
-            If not approved, write 'approved: false' and list the issues."
-        );
-
-        let reviewer_model = {
-            let conn = state.db.conn();
-            conn.query_row("SELECT model FROM tasks WHERE id = ?1", [task_id.as_str()], |r| r.get::<_,String>(0))
-                .unwrap_or_else(|_| "gpt-5.4".to_string())
-        };
-
-        add_event(&state, &task_id, "review", "🔍", "Reviewer agent started...", None);
-
-        // Spawn reviewer in same worktree (read-only review)
-        let review_result = run_cmd_timeout(&worktree, "codex", &[
-            "--yolo", "-m", &reviewer_model, "exec", &review_prompt
-        ], 600); // 10 min timeout
-
-        // Read REVIEW.md if it exists
-        let review_file = format!("{worktree}/REVIEW.md");
-        let review_content = std::fs::read_to_string(&review_file).unwrap_or_default();
-        let _ = std::fs::remove_file(&review_file); // clean up
-
-        let approved = review_content.to_lowercase().contains("approved: true")
-            || review_content.to_lowercase().contains("approved:true");
-
-        if !review_content.is_empty() {
-            if approved {
-                add_event(&state, &task_id, "review", "✅",
-                    "Reviewer approved", Some(&review_content));
-            } else {
-                add_event(&state, &task_id, "review", "❌",
-                    "Reviewer found issues", Some(&review_content));
-                all_passed = false;
-
-                // TODO: retry loop — brain dispatches builder v2 with reviewer feedback
-            }
-        } else {
-            // No REVIEW.md — check if tests passed in reviewer output
-            add_event(&state, &task_id, "review", "⚠️",
-                "Reviewer didn't produce REVIEW.md — treating as approved", None);
-        }
-    }
-
-    if !all_passed {
-        update_task_status(&state, &task_id, "failed");
-        add_event(&state, &task_id, "brain", "🧠", "Brain: review failed, not merging", None);
-        // Still learn from failures — they're the most valuable lessons
-        learn_from_task(&state, &task_id, &title, &model).await;
-        return;
-    }
-
     // Brain merges — gates passed + reviewer approved
     add_event(&state, &task_id, "brain", "🧠", "Brain: all gates green, reviewer approved → merging", None);
 
@@ -846,116 +947,183 @@ async fn run_task_pipeline(
         }
     }
 
-    // Brain learns from this task
-    learn_from_task(&state, &task_id, &title, &model).await;
-
     update_task_status(&state, &task_id, "done");
     add_event(&state, &task_id, "system", "🏁", "Task complete", None);
+    persist_task_outcome(
+        &knowledge_store,
+        &state,
+        &owner,
+        &repo,
+        task_id,
+        &title,
+        issue_number,
+        worktree,
+        "done",
+        "Task complete",
+        &model,
+        true,
+    )
+    .await;
 }
 
-/// Simple diff summary — show what lines were added/removed
-fn diff_summary(old: &str, new: &str) -> String {
-    let old_lines: std::collections::HashSet<&str> = old.lines().collect();
-    let new_lines: std::collections::HashSet<&str> = new.lines().collect();
-    
-    let added: Vec<&&str> = new_lines.difference(&old_lines).take(10).collect();
-    let removed: Vec<&&str> = old_lines.difference(&new_lines).take(10).collect();
-    
-    let mut summary = String::new();
-    if !added.is_empty() {
-        summary.push_str("Added:\n");
-        for line in &added {
-            summary.push_str(&format!("+ {}\n", line));
-        }
-    }
-    if !removed.is_empty() {
-        summary.push_str("Removed:\n");
-        for line in &removed {
-            summary.push_str(&format!("- {}\n", line));
-        }
-    }
-    if summary.is_empty() { "Minor reformatting".to_string() } else { summary }
+fn repo_checkout_path(owner: &str, repo: &str) -> String {
+    format!(
+        "{}/code/{}/{}",
+        std::env::var("HOME").unwrap_or_default(),
+        owner,
+        repo
+    )
 }
 
-/// Brain reviews what was learned from a task and updates project skills
-async fn learn_from_task(state: &Arc<AppState>, task_id: &str, title: &str, model: &str) {
-    add_event(state, task_id, "brain", "🧠", "Brain: reviewing what was learned...", None);
-
-    let events_summary = {
-        let conn = state.db.conn();
-        let mut stmt = conn.prepare(
-            "SELECT icon, message, detail FROM task_events WHERE task_id = ?1 ORDER BY id"
-        ).unwrap();
-        let events: Vec<String> = stmt.query_map([task_id], |row| {
-            let icon: String = row.get(0)?;
-            let msg: String = row.get(1)?;
-            let detail: Option<String> = row.get(2)?;
-            Ok(if let Some(d) = detail {
-                format!("{icon} {msg}\n  Detail: {}", d.chars().take(500).collect::<String>())
-            } else {
-                format!("{icon} {msg}")
-            })
-        }).unwrap().filter_map(|r| r.ok()).collect();
-        events.join("\n")
+fn fallback_prompt(title: &str, issue_number: Option<i64>, extra_instructions: Option<&str>) -> String {
+    let mut prompt = if let Some(issue_num) = issue_number {
+        format!(
+            "Fix issue #{issue_num}: {title}. Use `gh issue view {issue_num}` for full context. Implement the fix, run the relevant tests, commit, and push."
+        )
+    } else {
+        title.to_string()
     };
 
-    let current_skills = {
-        let conn = state.db.conn();
-        conn.query_row(
-            "SELECT p.skills FROM projects p JOIN tasks t ON t.project_id = p.id WHERE t.id = ?1",
-            [task_id],
-            |r| r.get::<_, String>(0),
-        ).unwrap_or_default()
+    if let Some(extra) = extra_instructions {
+        prompt.push_str(&format!("\n\nAdditional instructions:\n{extra}"));
+    }
+
+    prompt
+}
+
+fn build_planning_knowledge(
+    project_skills: &str,
+    persistent_knowledge: &str,
+    recent_history: &[TaskRecord],
+    extra_instructions: Option<&str>,
+) -> String {
+    let history_json = if recent_history.is_empty() {
+        "[]".to_string()
+    } else {
+        serde_json::to_string_pretty(recent_history).unwrap_or_else(|_| "[]".to_string())
     };
 
-    let learn_prompt = format!(
-        "A coding agent just completed a task (it may have succeeded or failed). \
-        Review the event timeline and update the project skills document with anything learned.\n\n\
-        ## Task: {title}\n\n\
-        ## Events Timeline\n{events_summary}\n\n\
-        ## Current Skills Document\n{current_skills}\n\n\
-        Rules:\n\
-        - ADD new gotchas, patterns, or learnings discovered during this task\n\
-        - Failures are especially valuable — if something went wrong, document WHY and HOW to avoid it\n\
-        - KEEP everything already in the skills doc that's still relevant\n\
-        - REMOVE anything proven wrong by this task\n\
-        - If nothing new was learned, return the skills document UNCHANGED\n\
-        - Be specific: \"use thread_local! not tokio::task_local! because WASM is single-threaded\"\n\
-        - Keep it under 2000 words\n\n\
-        Return ONLY the updated skills document (raw markdown, no code fences)."
-    );
+    let extra = extra_instructions.unwrap_or("None");
+    let db_skills = if project_skills.trim().is_empty() {
+        "None"
+    } else {
+        project_skills
+    };
+    let knowledge = if persistent_knowledge.trim().is_empty() {
+        "None"
+    } else {
+        persistent_knowledge
+    };
 
-    match crate::brain::call_llm_pub(model,
-        "You maintain a project knowledge document for coding agents. Output raw markdown only, no wrapping.",
-        &learn_prompt).await
-    {
-        Ok(updated_skills) => {
-            let changed = updated_skills.trim() != current_skills.trim();
-            if changed && !updated_skills.trim().is_empty() {
-                let conn = state.db.conn();
-                let _ = conn.execute(
-                    "UPDATE projects SET skills = ?1 WHERE id = (SELECT project_id FROM tasks WHERE id = ?2)",
-                    rusqlite::params![updated_skills.trim(), task_id],
+    format!(
+        "## Additional Instructions\n{extra}\n\n## Project Skills\n{db_skills}\n\n## Persistent Knowledge\n{knowledge}\n\n## Recent Task History\n{history_json}"
+    )
+}
+
+fn format_recon_detail(recon: &crate::recon::ReconReport) -> String {
+    let issue_title = recon
+        .issue
+        .as_ref()
+        .map(|issue| issue.title.as_str())
+        .unwrap_or("No GitHub issue loaded");
+    let branch = recon.existing_branch.as_deref().unwrap_or("none");
+    let tests = recon
+        .baseline_tests
+        .as_ref()
+        .map(|result| {
+            format!(
+                "{} ({})",
+                if result.success { "passed" } else { "failed" },
+                result.command
+            )
+        })
+        .unwrap_or_else(|| "not run".to_string());
+
+    format!(
+        "Issue: {issue_title}\nRelated PRs: {}\nExisting branch: {branch}\nRecent commits checked: {}\nBaseline tests: {tests}\nPossibly fixed on main: {}",
+        recon.related_prs.len(),
+        recon.recent_commits.len(),
+        recon.possibly_fixed
+    )
+}
+
+fn capture_task_diff(worktree: &str) -> String {
+    let diff = run_cmd(worktree, "git", &["diff", "main...HEAD"]);
+    if diff.0 && !diff.1.trim().is_empty() {
+        return diff.1;
+    }
+
+    let fallback = run_cmd(worktree, "git", &["diff", "HEAD~1..HEAD"]);
+    if fallback.0 {
+        fallback.1
+    } else {
+        String::new()
+    }
+}
+
+fn latest_task_summary(state: &AppState, task_id: &str, fallback: &str) -> String {
+    let conn = state.db.conn();
+    conn.query_row(
+        "SELECT message FROM task_events WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+        [task_id],
+        |row| row.get::<_, String>(0),
+    )
+    .unwrap_or_else(|_| fallback.to_string())
+}
+
+async fn persist_task_outcome(
+    knowledge_store: &KnowledgeStore,
+    state: &Arc<AppState>,
+    owner: &str,
+    repo: &str,
+    task_id: &str,
+    title: &str,
+    issue_number: Option<i64>,
+    worktree: &str,
+    outcome: &str,
+    fallback_summary: &str,
+    model: &str,
+    extract_learnings: bool,
+) {
+    let diff = if extract_learnings {
+        capture_task_diff(worktree)
+    } else {
+        String::new()
+    };
+
+    if extract_learnings {
+        add_event(state, task_id, "brain", "📚", "Brain: extracting learnings...", None);
+        match crate::brain::extract_learnings(task_id, outcome, &diff, model).await {
+            Ok(learnings) if !learnings.trim().is_empty() => {
+                knowledge_store.append_knowledge(owner, repo, &learnings);
+                add_event(state, task_id, "brain", "📚", "Knowledge updated", Some(&learnings));
+            }
+            Ok(_) => {
+                add_event(state, task_id, "brain", "📚", "No durable learnings extracted", None);
+            }
+            Err(err) => {
+                add_event(
+                    state,
+                    task_id,
+                    "brain",
+                    "⚠️",
+                    &format!("Learning extraction failed: {err}"),
+                    None,
                 );
-                add_event(state, task_id, "brain", "📚", "Skills updated with new learnings",
-                    Some(&diff_summary(&current_skills, &updated_skills)));
-            } else {
-                add_event(state, task_id, "brain", "📚", "No new learnings to add", None);
             }
         }
-        Err(e) => {
-            add_event(state, task_id, "brain", "⚠️",
-                &format!("Skills update failed: {e}"), None);
-        }
     }
-}
 
-pub fn run_cmd_timeout_pub(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
-    run_cmd_timeout(workdir, cmd, args, timeout_secs)
-}
-
-fn run_cmd_timeout(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
-    run_cmd_timeout_sync(workdir, cmd, args, timeout_secs)
+    let summary = latest_task_summary(state, task_id, fallback_summary);
+    let record = TaskRecord {
+        task_id: task_id.to_string(),
+        title: title.to_string(),
+        issue_number,
+        outcome: outcome.to_string(),
+        summary,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    knowledge_store.record_task(owner, repo, &record);
 }
 
 /// Non-blocking version with actual timeout
