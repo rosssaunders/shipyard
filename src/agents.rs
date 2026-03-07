@@ -65,6 +65,15 @@ struct AgentProcess {
     output: Arc<Mutex<String>>,
 }
 
+struct AgentCompletionContext {
+    worktree: String,
+    branch: String,
+    owner: String,
+    repo: String,
+    issue_number: Option<i64>,
+    gates: QualityGates,
+}
+
 impl AgentManager {
     pub fn new() -> Self {
         Self {
@@ -113,12 +122,12 @@ impl AgentManager {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 if finished_clone.load(std::sync::atomic::Ordering::Relaxed) {
                     // One final read after exit
-                    if let Ok(content) = tokio::fs::read_to_string(&log_file_clone).await {
-                        if content.len() as u64 > last_size {
-                            let new_content = &content[last_size as usize..];
-                            let cleaned = strip_ansi(new_content);
-                            output_clone.lock().unwrap().push_str(&cleaned);
-                        }
+                    if let Ok(content) = tokio::fs::read_to_string(&log_file_clone).await
+                        && content.len() as u64 > last_size
+                    {
+                        let new_content = &content[last_size as usize..];
+                        let cleaned = strip_ansi(new_content);
+                        output_clone.lock().unwrap().push_str(&cleaned);
                     }
                     break;
                 }
@@ -300,23 +309,16 @@ pub async fn spawn_agent(
     // Spawn background watcher for quality gates
     let watcher_state = state.clone();
     let watcher_id = id.clone();
-    let watcher_worktree = worktree_path.clone();
-    let watcher_branch = branch.clone();
-    let watcher_owner = owner.clone();
-    let watcher_repo = repo.clone();
-    let watcher_issue = req.issue_number;
+    let watcher_ctx = AgentCompletionContext {
+        worktree: worktree_path.clone(),
+        branch: branch.clone(),
+        owner: owner.clone(),
+        repo: repo.clone(),
+        issue_number: req.issue_number,
+        gates,
+    };
     tokio::spawn(async move {
-        watch_agent_completion(
-            watcher_state,
-            &watcher_id,
-            &watcher_worktree,
-            &watcher_branch,
-            &watcher_owner,
-            &watcher_repo,
-            watcher_issue,
-            gates,
-        )
-        .await;
+        watch_agent_completion(watcher_state, &watcher_id, watcher_ctx).await;
     });
 
     Json(Agent {
@@ -429,12 +431,7 @@ pub async fn kill_agent(
 async fn watch_agent_completion(
     state: Arc<AppState>,
     agent_id: &str,
-    worktree: &str,
-    branch: &str,
-    owner: &str,
-    repo: &str,
-    issue_number: Option<i64>,
-    gates: QualityGates,
+    ctx: AgentCompletionContext,
 ) {
     // Poll until agent process finishes
     loop {
@@ -482,20 +479,20 @@ async fn watch_agent_completion(
     let mut all_passed = true;
 
     // Gate 1: Tests
-    if gates.tests {
+    if ctx.gates.tests {
         let gate_id = uuid::Uuid::new_v4().to_string();
         record_gate(&state, &gate_id, agent_id, "tests", "running");
-        let output = run_command(worktree, "cargo", &["test"]);
+        let output = run_command(&ctx.worktree, "cargo", &["test"]);
         let passed = output.0;
         record_gate_result(&state, &gate_id, if passed { "passed" } else { "failed" }, &output.1);
         if !passed { all_passed = false; }
     }
 
     // Gate 2: Clippy
-    if gates.clippy && all_passed {
+    if ctx.gates.clippy && all_passed {
         let gate_id = uuid::Uuid::new_v4().to_string();
         record_gate(&state, &gate_id, agent_id, "clippy", "running");
-        let output = run_command(worktree, "cargo", &["clippy", "--all-targets", "--", "-D", "warnings"]);
+        let output = run_command(&ctx.worktree, "cargo", &["clippy", "--all-targets", "--", "-D", "warnings"]);
         let passed = output.0;
         record_gate_result(&state, &gate_id, if passed { "passed" } else { "failed" }, &output.1);
         if !passed { all_passed = false; }
@@ -503,40 +500,40 @@ async fn watch_agent_completion(
 
     // Gate 3: Create PR
     if all_passed {
-        let title = issue_number
+        let title = ctx.issue_number
             .map(|n| format!("fix: resolve issue #{n}"))
             .unwrap_or_else(|| format!("shipyard: agent {}", &agent_id[..8]));
 
         let body = format!(
             "Automated by [Shipyard](https://github.com/rosssaunders/shipyard)\n\n{}",
-            issue_number.map(|n| format!("Closes #{n}")).unwrap_or_default()
+            ctx.issue_number.map(|n| format!("Closes #{n}")).unwrap_or_default()
         );
 
         // Push branch
-        let _ = run_command(worktree, "git", &["push", "-u", "origin", branch, "--no-verify"]);
+        let _ = run_command(&ctx.worktree, "git", &["push", "-u", "origin", &ctx.branch, "--no-verify"]);
 
         // Create PR
         let pr_output = run_command(
-            worktree,
+            &ctx.worktree,
             "gh",
             &[
                 "pr", "create",
-                "--repo", &format!("{owner}/{repo}"),
-                "--head", branch,
+                "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
+                "--head", &ctx.branch,
                 "--title", &title,
                 "--body", &body,
             ],
         );
 
         // Gate 4: AI code review
-        if gates.review && pr_output.0 {
+        if ctx.gates.review && pr_output.0 {
             let gate_id = uuid::Uuid::new_v4().to_string();
             record_gate(&state, &gate_id, agent_id, "review", "running");
             // Use a second Codex instance to review
             let review_output = run_command(
-                worktree,
+                &ctx.worktree,
                 "gh",
-                &["pr", "diff", "--repo", &format!("{owner}/{repo}"), branch],
+                &["pr", "diff", "--repo", &format!("{}/{}", ctx.owner, ctx.repo), &ctx.branch],
             );
             // For now, mark review as passed if PR was created
             // TODO: dispatch to small model for actual review
@@ -544,17 +541,17 @@ async fn watch_agent_completion(
         }
 
         // Gate 5: Auto-merge
-        if gates.auto_merge && all_passed {
+        if ctx.gates.auto_merge && all_passed {
             let gate_id = uuid::Uuid::new_v4().to_string();
             record_gate(&state, &gate_id, agent_id, "merge", "running");
             let merge_output = run_command(
-                worktree,
+                &ctx.worktree,
                 "gh",
                 &[
                     "pr", "merge",
-                    "--repo", &format!("{owner}/{repo}"),
+                    "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
                     "--squash", "--admin",
-                    branch,
+                    &ctx.branch,
                 ],
             );
             record_gate_result(

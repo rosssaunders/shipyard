@@ -23,7 +23,7 @@ async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
         "message": "⚓ Welcome to Shipyard"
     });
     let _ = socket
-        .send(Message::Text(welcome.to_string().into()))
+        .send(Message::Text(welcome.to_string()))
         .await;
 
     // Handle incoming messages
@@ -34,7 +34,7 @@ async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
                 if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(text_str) {
                     let response = handle_command(cmd).await;
                     let _ = socket
-                        .send(Message::Text(response.to_string().into()))
+                        .send(Message::Text(response.to_string()))
                         .await;
                 }
             }

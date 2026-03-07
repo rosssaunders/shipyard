@@ -57,22 +57,22 @@ pub fn spawn_log_parser(
 
                 // Detect stage transitions
                 if is_reading_line(trimmed) {
-                    if let Some(file) = extract_filename(trimmed) {
-                        if !parser.files_read.contains(&file) {
-                            parser.files_read.push(file.clone());
-                            if parser.current_stage != Stage::Reading {
-                                parser.current_stage = Stage::Reading;
-                                add_event(&state, &task_id, "stage", "📖",
-                                    "Reading codebase...", None);
-                            }
-                            // Batch file reads — emit every 3 files
-                            if parser.files_read.len() % 3 == 0 {
-                                let recent: Vec<_> = parser.files_read.iter()
-                                    .rev().take(3).collect();
-                                add_event(&state, &task_id, "stage", "📖",
-                                    &format!("Read {} files", parser.files_read.len()),
-                                    Some(&recent.iter().map(|f| format!("  {f}")).collect::<Vec<_>>().join("\n")));
-                            }
+                    if let Some(file) = extract_filename(trimmed)
+                        && !parser.files_read.contains(&file)
+                    {
+                        parser.files_read.push(file.clone());
+                        if parser.current_stage != Stage::Reading {
+                            parser.current_stage = Stage::Reading;
+                            add_event(&state, &task_id, "stage", "📖",
+                                "Reading codebase...", None);
+                        }
+                        // Batch file reads — emit every 3 files
+                        if parser.files_read.len().is_multiple_of(3) {
+                            let recent: Vec<_> = parser.files_read.iter()
+                                .rev().take(3).collect();
+                            add_event(&state, &task_id, "stage", "📖",
+                                &format!("Read {} files", parser.files_read.len()),
+                                Some(&recent.iter().map(|f| format!("  {f}")).collect::<Vec<_>>().join("\n")));
                         }
                     }
                 } else if is_thinking_line(trimmed) {
@@ -84,13 +84,13 @@ pub fn spawn_log_parser(
                             &format!("Thinking: {}", truncate(&thought, 100)), None);
                     }
                 } else if is_writing_line(trimmed) {
-                    if let Some(file) = extract_written_filename(trimmed) {
-                        if !parser.files_written.contains(&file) {
-                            parser.files_written.push(file.clone());
-                            parser.current_stage = Stage::Writing;
-                            add_event(&state, &task_id, "stage", "✏️",
-                                &format!("Writing {file}"), None);
-                        }
+                    if let Some(file) = extract_written_filename(trimmed)
+                        && !parser.files_written.contains(&file)
+                    {
+                        parser.files_written.push(file.clone());
+                        parser.current_stage = Stage::Writing;
+                        add_event(&state, &task_id, "stage", "✏️",
+                            &format!("Writing {file}"), None);
                     }
                 } else if is_running_line(trimmed) {
                     if parser.current_stage != Stage::Running {

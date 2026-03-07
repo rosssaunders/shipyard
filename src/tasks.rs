@@ -136,14 +136,20 @@ pub async fn submit_intent(
     // Run pipeline in background
     let bg_state = state.clone();
     let bg_id = id.clone();
-    let bg_text = req.text.clone();
-    let bg_branch = branch.clone();
+    let bg_ctx = TaskPipelineContext {
+        owner,
+        repo,
+        model,
+        agent_type,
+        branch,
+        worktree_path,
+        title: req.text.clone(),
+        issue_number,
+        extra_instructions: None,
+        gates: QualityGates { tests: true, clippy: true, review: true, auto_merge: true },
+    };
     tokio::spawn(async move {
-        run_task_pipeline(
-            bg_state, bg_id, owner, repo, model, agent_type,
-            bg_branch, worktree_path, bg_text, issue_number, None,
-            QualityGates { tests: true, clippy: true, review: true, auto_merge: true },
-        ).await;
+        run_task_pipeline(bg_state, bg_id, bg_ctx).await;
     });
 
     Json(serde_json::json!({"ok": true, "task_id": id}))
@@ -251,6 +257,20 @@ pub struct CreateTaskRequest {
     pub agent_type: Option<String>,
     pub quality_gates: Option<QualityGates>,
     pub extra_instructions: Option<String>,
+}
+
+#[derive(Clone)]
+struct TaskPipelineContext {
+    owner: String,
+    repo: String,
+    model: String,
+    agent_type: String,
+    branch: String,
+    worktree_path: String,
+    title: String,
+    issue_number: Option<i64>,
+    extra_instructions: Option<String>,
+    gates: QualityGates,
 }
 
 /// Add an event to a task's timeline
@@ -468,22 +488,21 @@ pub async fn create_task(
 
     let bg_state = state.clone();
     let bg_id = id.clone();
-    let bg_owner = owner.clone();
-    let bg_repo = repo.clone();
-    let bg_model = model.clone();
-    let bg_agent_type = agent_type.clone();
-    let bg_branch = branch.clone();
-    let bg_worktree = worktree_path.clone();
-    let bg_title = req.title.clone();
-    let bg_issue = req.issue_number;
-    let bg_extra = req.extra_instructions.clone();
-    let bg_gates = gates;
+    let bg_ctx = TaskPipelineContext {
+        owner,
+        repo,
+        model,
+        agent_type,
+        branch,
+        worktree_path,
+        title: req.title.clone(),
+        issue_number: req.issue_number,
+        extra_instructions: req.extra_instructions.clone(),
+        gates,
+    };
 
     tokio::spawn(async move {
-        run_task_pipeline(
-            bg_state, bg_id, bg_owner, bg_repo, bg_model, bg_agent_type,
-            bg_branch, bg_worktree, bg_title, bg_issue, bg_extra, bg_gates,
-        ).await;
+        run_task_pipeline(bg_state, bg_id, bg_ctx).await;
     });
 
     Json(task.unwrap())
@@ -546,27 +565,14 @@ pub async fn kill_task(
     Json(killed)
 }
 
-async fn run_task_pipeline(
-    state: Arc<AppState>,
-    id: String,
-    owner: String,
-    repo: String,
-    model: String,
-    agent_type: String,
-    branch: String,
-    worktree_path: String,
-    title: String,
-    issue_number: Option<i64>,
-    extra_instructions: Option<String>,
-    gates: QualityGates,
-) {
-    let task_id = &id;
-    let worktree = &worktree_path;
-    let repo_path = repo_checkout_path(&owner, &repo);
+async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineContext) {
+    let task_id = id.as_str();
+    let worktree = ctx.worktree_path.as_str();
+    let repo_path = repo_checkout_path(&ctx.owner, &ctx.repo);
     let knowledge_store = KnowledgeStore::new();
 
     add_event(&state, task_id, "recon", "🔍", "Recon: gathering repo and issue context...", None);
-    let recon = crate::recon::run_recon(&owner, &repo, issue_number, &repo_path).await;
+    let recon = crate::recon::run_recon(&ctx.owner, &ctx.repo, ctx.issue_number, &repo_path).await;
     add_event(
         &state,
         task_id,
@@ -585,18 +591,18 @@ async fn run_task_pipeline(
         )
         .unwrap_or_default()
     };
-    let persistent_knowledge = knowledge_store.load_knowledge(&owner, &repo);
-    let recent_history = knowledge_store.recent_history(&owner, &repo, 8);
+    let persistent_knowledge = knowledge_store.load_knowledge(&ctx.owner, &ctx.repo);
+    let recent_history = knowledge_store.recent_history(&ctx.owner, &ctx.repo, 8);
     let planning_knowledge = build_planning_knowledge(
         &project_skills,
         &persistent_knowledge,
         &recent_history,
-        extra_instructions.as_deref(),
+        ctx.extra_instructions.as_deref(),
     );
 
     add_event(&state, task_id, "brain", "🧠", "Brain: planning from recon report...", None);
 
-    let plan = crate::brain::plan_task(&recon, &planning_knowledge, &model).await;
+    let plan = crate::brain::plan_task(&recon, &planning_knowledge, &ctx.model).await;
     let mut max_wait = std::time::Duration::from_secs(12 * 3600);
 
     let prompt = match &plan {
@@ -623,15 +629,10 @@ async fn run_task_pipeline(
                 persist_task_outcome(
                     &knowledge_store,
                     &state,
-                    &owner,
-                    &repo,
+                    &ctx,
                     task_id,
-                    &title,
-                    issue_number,
-                    worktree,
                     "skipped",
                     skip_reason,
-                    &model,
                     false,
                 )
                 .await;
@@ -643,7 +644,7 @@ async fn run_task_pipeline(
             }
 
             if plan.prompt.trim().is_empty() {
-                fallback_prompt(&title, issue_number, extra_instructions.as_deref())
+                fallback_prompt(&ctx.title, ctx.issue_number, ctx.extra_instructions.as_deref())
             } else {
                 plan.prompt.clone()
             }
@@ -657,17 +658,17 @@ async fn run_task_pipeline(
                 &format!("Brain planning failed, using fallback prompt: {e}"),
                 None,
             );
-            fallback_prompt(&title, issue_number, extra_instructions.as_deref())
+            fallback_prompt(&ctx.title, ctx.issue_number, ctx.extra_instructions.as_deref())
         }
     };
 
     add_event(&state, task_id, "dispatch", "🚀",
-        &format!("Dispatching to {} ({})", agent_type, model), None);
+        &format!("Dispatching to {} ({})", ctx.agent_type, ctx.model), None);
 
     // Spawn agent
     let pid = state
         .agents
-        .spawn(task_id, worktree, &model, &prompt, &agent_type)
+        .spawn(task_id, worktree, &ctx.model, &prompt, &ctx.agent_type)
         .await
         .unwrap_or(0);
 
@@ -687,33 +688,28 @@ async fn run_task_pipeline(
     let start = std::time::Instant::now();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        let still_running = state.agents.is_running(&task_id);
+        let still_running = state.agents.is_running(task_id);
         if !still_running {
             break;
         }
         if start.elapsed() > max_wait {
             add_event(
                 &state,
-                &task_id,
+                task_id,
                 "system",
                 "⏰",
                 &format!("Agent timed out after {} seconds", max_wait.as_secs()),
                 None,
             );
-            state.agents.kill(&task_id);
-            update_task_status(&state, &task_id, "failed");
+            state.agents.kill(task_id);
+            update_task_status(&state, task_id, "failed");
             persist_task_outcome(
                 &knowledge_store,
                 &state,
-                &owner,
-                &repo,
+                &ctx,
                 task_id,
-                &title,
-                issue_number,
-                worktree,
                 "failed",
                 "Agent timed out",
-                &model,
                 true,
             )
             .await;
@@ -721,35 +717,30 @@ async fn run_task_pipeline(
         }
     }
 
-    add_event(&state, &task_id, "agent", "🔨", "Agent finished coding", None);
-    update_task_status(&state, &task_id, "gates");
+    add_event(&state, task_id, "agent", "🔨", "Agent finished coding", None);
+    update_task_status(&state, task_id, "gates");
 
     // Auto-commit any uncommitted changes the agent left behind
     let status = run_cmd(worktree, "git", &["status", "--porcelain"]);
     if status.0 && !status.1.trim().is_empty() {
-        add_event(&state, &task_id, "system", "📝", "Auto-committing uncommitted changes...", None);
+        add_event(&state, task_id, "system", "📝", "Auto-committing uncommitted changes...", None);
         let _ = run_cmd(worktree, "git", &["add", "-A"]);
-        let commit_msg = format!("feat: {}", title.chars().take(72).collect::<String>());
+        let commit_msg = format!("feat: {}", ctx.title.chars().take(72).collect::<String>());
         let _ = run_cmd(worktree, "git", &["commit", "-m", &commit_msg]);
     }
 
     // Check if there are any commits
     let has_commits = run_cmd(worktree, "git", &["log", "--oneline", "HEAD", "^main", "--"]);
     if !has_commits.0 || has_commits.1.trim().is_empty() {
-        add_event(&state, &task_id, "error", "⚠️", "No commits produced by agent", None);
-        update_task_status(&state, &task_id, "failed");
+        add_event(&state, task_id, "error", "⚠️", "No commits produced by agent", None);
+        update_task_status(&state, task_id, "failed");
         persist_task_outcome(
             &knowledge_store,
             &state,
-            &owner,
-            &repo,
+            &ctx,
             task_id,
-            &title,
-            issue_number,
-            worktree,
             "failed",
             "No commits produced by agent",
-            &model,
             true,
         )
         .await;
@@ -757,14 +748,14 @@ async fn run_task_pipeline(
     }
 
     let commit_count = has_commits.1.trim().lines().count();
-    add_event(&state, &task_id, "info", "📝",
+    add_event(&state, task_id, "info", "📝",
         &format!("{commit_count} commit(s) ready"), None);
 
     // Run quality gates from project skills (Layer 1: Supervisor)
     let mut attempt = 0u32;
     let all_passed = loop {
         attempt += 1;
-        let results = crate::supervisor::run_skill_gates(&state, &task_id, worktree).await;
+        let results = crate::supervisor::run_skill_gates(&state, task_id, worktree).await;
         let failures: Vec<_> = results.iter().filter(|r| !r.passed).collect();
 
         if failures.is_empty() {
@@ -772,13 +763,13 @@ async fn run_task_pipeline(
         }
 
         // Supervisor: attempt to fix
-        add_event(&state, &task_id, "supervisor", "🔧",
+        add_event(&state, task_id, "supervisor", "🔧",
             &format!("Supervisor: {} gate(s) failed, dispatching fixer (attempt {})",
                 failures.len(), attempt), None);
 
         let failed_results: Vec<_> = results.into_iter().filter(|r| !r.passed).collect();
         let fixed = crate::supervisor::attempt_fix(
-            &state, &task_id, worktree, &failed_results, &model, attempt,
+            &state, task_id, worktree, &failed_results, &ctx.model, attempt,
         ).await;
 
         if !fixed {
@@ -793,51 +784,46 @@ async fn run_task_pipeline(
                 &format!("fix: resolve gate failures (attempt {attempt})")]);
         }
 
-        add_event(&state, &task_id, "supervisor", "🔄", "Re-running gates...", None);
+        add_event(&state, task_id, "supervisor", "🔄", "Re-running gates...", None);
     };
 
     if !all_passed {
-        update_task_status(&state, &task_id, "failed");
-        add_event(&state, &task_id, "supervisor", "❌", "Supervisor: gates failed after all fix attempts", None);
+        update_task_status(&state, task_id, "failed");
+        add_event(&state, task_id, "supervisor", "❌", "Supervisor: gates failed after all fix attempts", None);
         persist_task_outcome(
             &knowledge_store,
             &state,
-            &owner,
-            &repo,
+            &ctx,
             task_id,
-            &title,
-            issue_number,
-            worktree,
             "failed",
             "Supervisor gates failed after all fix attempts",
-            &model,
             true,
         )
         .await;
         return;
     }
 
-    if gates.review {
-        add_event(&state, &task_id, "review", "🧠", "Brain: reviewing diff...", None);
+    if ctx.gates.review {
+        add_event(&state, task_id, "review", "🧠", "Brain: reviewing diff...", None);
         let diff = capture_task_diff(worktree);
         if diff.trim().is_empty() {
             add_event(
                 &state,
-                &task_id,
+                task_id,
                 "review",
                 "⚠️",
                 "Brain review skipped because diff was empty",
                 None,
             );
         } else {
-            match crate::brain::review_diff(&diff, &recon, &planning_knowledge, &model).await {
+            match crate::brain::review_diff(&diff, &recon, &planning_knowledge, &ctx.model).await {
                 Ok(review) if review.approved => {
                     let detail = if review.issues.is_empty() {
                         review.summary.clone()
                     } else {
                         format!("{}\n\n{}", review.summary, review.issues.join("\n"))
                     };
-                    add_event(&state, &task_id, "review", "✅", "Brain review approved", Some(&detail));
+                    add_event(&state, task_id, "review", "✅", "Brain review approved", Some(&detail));
                 }
                 Ok(review) => {
                     let mut detail = review.summary;
@@ -849,20 +835,15 @@ async fn run_task_pipeline(
                         detail.push_str("\n\nSuggestion:\n");
                         detail.push_str(&suggestion);
                     }
-                    add_event(&state, &task_id, "review", "❌", "Brain review rejected the diff", Some(&detail));
-                    update_task_status(&state, &task_id, "failed");
+                    add_event(&state, task_id, "review", "❌", "Brain review rejected the diff", Some(&detail));
+                    update_task_status(&state, task_id, "failed");
                     persist_task_outcome(
                         &knowledge_store,
                         &state,
-                        &owner,
-                        &repo,
+                        &ctx,
                         task_id,
-                        &title,
-                        issue_number,
-                        worktree,
                         "failed",
                         "Brain review rejected the diff",
-                        &model,
                         true,
                     )
                     .await;
@@ -871,7 +852,7 @@ async fn run_task_pipeline(
                 Err(e) => {
                     add_event(
                         &state,
-                        &task_id,
+                        task_id,
                         "review",
                         "⚠️",
                         &format!("Brain review failed, continuing: {e}"),
@@ -883,84 +864,74 @@ async fn run_task_pipeline(
     }
 
     // Push and create PR
-    add_event(&state, &task_id, "system", "🚀", "Pushing branch...", None);
-    let push = run_cmd(&worktree, "git", &["push", "-u", "origin", &branch, "--no-verify"]);
+    add_event(&state, task_id, "system", "🚀", "Pushing branch...", None);
+    let push = run_cmd(worktree, "git", &["push", "-u", "origin", &ctx.branch, "--no-verify"]);
     if !push.0 {
-        add_event(&state, &task_id, "error", "❌", "Failed to push branch", Some(&push.1));
-        update_task_status(&state, &task_id, "failed");
+        add_event(&state, task_id, "error", "❌", "Failed to push branch", Some(&push.1));
+        update_task_status(&state, task_id, "failed");
         persist_task_outcome(
             &knowledge_store,
             &state,
-            &owner,
-            &repo,
+            &ctx,
             task_id,
-            &title,
-            issue_number,
-            worktree,
             "failed",
             "Failed to push branch",
-            &model,
             true,
         )
         .await;
         return;
     }
 
-    let pr_title = issue_number
+    let pr_title = ctx.issue_number
         .map(|n| format!("fix: resolve issue #{n}"))
         .unwrap_or_else(|| format!("shipyard: {}", &task_id[..8]));
     let pr_body = format!(
         "Automated by [Shipyard](https://github.com/rosssaunders/shipyard)\n\n{}",
-        issue_number.map(|n| format!("Closes #{n}")).unwrap_or_default()
+        ctx.issue_number.map(|n| format!("Closes #{n}")).unwrap_or_default()
     );
 
-    let pr = run_cmd(&worktree, "gh", &[
+    let pr = run_cmd(worktree, "gh", &[
         "pr", "create",
-        "--repo", &format!("{owner}/{repo}"),
-        "--head", &branch,
+        "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
+        "--head", &ctx.branch,
         "--title", &pr_title,
         "--body", &pr_body,
     ]);
 
     if pr.0 {
         let pr_url = pr.1.trim();
-        add_event(&state, &task_id, "pr", "🔗", &format!("PR created: {pr_url}"), None);
+        add_event(&state, task_id, "pr", "🔗", &format!("PR created: {pr_url}"), None);
     } else {
-        add_event(&state, &task_id, "error", "⚠️", "Failed to create PR", Some(&pr.1));
+        add_event(&state, task_id, "error", "⚠️", "Failed to create PR", Some(&pr.1));
     }
 
     // Brain merges — gates passed + reviewer approved
-    add_event(&state, &task_id, "brain", "🧠", "Brain: all gates green, reviewer approved → merging", None);
+    add_event(&state, task_id, "brain", "🧠", "Brain: all gates green, reviewer approved → merging", None);
 
     // Always merge if gates pass (brain decides, not the user)
     {
-        add_event(&state, &task_id, "system", "🔀", "Auto-merging...", None);
-        let merge = run_cmd(&worktree, "gh", &[
+        add_event(&state, task_id, "system", "🔀", "Auto-merging...", None);
+        let merge = run_cmd(worktree, "gh", &[
             "pr", "merge",
-            "--repo", &format!("{owner}/{repo}"),
-            "--squash", "--admin", &branch,
+            "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
+            "--squash", "--admin", &ctx.branch,
         ]);
         if merge.0 {
-            add_event(&state, &task_id, "system", "✅", "Merged to main", None);
+            add_event(&state, task_id, "system", "✅", "Merged to main", None);
         } else {
-            add_event(&state, &task_id, "error", "⚠️", "Auto-merge failed", Some(&merge.1));
+            add_event(&state, task_id, "error", "⚠️", "Auto-merge failed", Some(&merge.1));
         }
     }
 
-    update_task_status(&state, &task_id, "done");
-    add_event(&state, &task_id, "system", "🏁", "Task complete", None);
+    update_task_status(&state, task_id, "done");
+    add_event(&state, task_id, "system", "🏁", "Task complete", None);
     persist_task_outcome(
         &knowledge_store,
         &state,
-        &owner,
-        &repo,
+        &ctx,
         task_id,
-        &title,
-        issue_number,
-        worktree,
         "done",
         "Task complete",
-        &model,
         true,
     )
     .await;
@@ -1074,28 +1045,23 @@ fn latest_task_summary(state: &AppState, task_id: &str, fallback: &str) -> Strin
 async fn persist_task_outcome(
     knowledge_store: &KnowledgeStore,
     state: &Arc<AppState>,
-    owner: &str,
-    repo: &str,
+    ctx: &TaskPipelineContext,
     task_id: &str,
-    title: &str,
-    issue_number: Option<i64>,
-    worktree: &str,
     outcome: &str,
     fallback_summary: &str,
-    model: &str,
     extract_learnings: bool,
 ) {
     let diff = if extract_learnings {
-        capture_task_diff(worktree)
+        capture_task_diff(&ctx.worktree_path)
     } else {
         String::new()
     };
 
     if extract_learnings {
         add_event(state, task_id, "brain", "📚", "Brain: extracting learnings...", None);
-        match crate::brain::extract_learnings(task_id, outcome, &diff, model).await {
+        match crate::brain::extract_learnings(task_id, outcome, &diff, &ctx.model).await {
             Ok(learnings) if !learnings.trim().is_empty() => {
-                knowledge_store.append_knowledge(owner, repo, &learnings);
+                knowledge_store.append_knowledge(&ctx.owner, &ctx.repo, &learnings);
                 add_event(state, task_id, "brain", "📚", "Knowledge updated", Some(&learnings));
             }
             Ok(_) => {
@@ -1117,13 +1083,13 @@ async fn persist_task_outcome(
     let summary = latest_task_summary(state, task_id, fallback_summary);
     let record = TaskRecord {
         task_id: task_id.to_string(),
-        title: title.to_string(),
-        issue_number,
+        title: ctx.title.to_string(),
+        issue_number: ctx.issue_number,
         outcome: outcome.to_string(),
         summary,
         created_at: chrono::Utc::now().to_rfc3339(),
     };
-    knowledge_store.record_task(owner, repo, &record);
+    knowledge_store.record_task(&ctx.owner, &ctx.repo, &record);
 }
 
 /// Non-blocking version with actual timeout
