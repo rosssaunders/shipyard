@@ -1,6 +1,7 @@
 mod db;
 mod agents;
 mod brain;
+mod knowledge;
 mod recon;
 mod log_parser;
 mod projects;
