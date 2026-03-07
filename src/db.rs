@@ -36,7 +36,7 @@ impl Database {
                 title TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 agent_type TEXT NOT NULL DEFAULT 'codex',
-                model TEXT NOT NULL DEFAULT 'gpt-5.4',
+                model TEXT NOT NULL DEFAULT 'claude-sonnet-4.5',
                 worktree_path TEXT,
                 branch TEXT,
                 pid INTEGER,

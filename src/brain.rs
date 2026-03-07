@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tracing::warn;
 
+use crate::config::Config;
 use crate::recon::ReconReport;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -165,10 +166,11 @@ async fn call_llm(
     user: &str,
     response_format: Option<serde_json::Value>,
 ) -> Result<String> {
-    let endpoint = llm_endpoint();
+    let config = Config::from_env();
+    let endpoint = config.llm_endpoint.clone();
     let url = format!("{}/chat/completions", endpoint.trim_end_matches('/'));
-    let model = resolved_model(model);
-    let api_key = std::env::var("SHIPYARD_API_KEY").unwrap_or_default();
+    let model = resolved_model(model, &config);
+    let api_key = config.api_key;
 
     let mut body = json!({
         "model": model,
@@ -216,15 +218,13 @@ fn parse_json_response<T>(response: &str) -> Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let cleaned = response
-        .trim()
+    let trimmed = response.trim();
+    let without_prefix = trimmed
         .strip_prefix("```json")
-        .or_else(|| response.trim().strip_prefix("```"))
-        .unwrap_or(response)
-        .trim()
-        .strip_suffix("```")
-        .unwrap_or(response)
+        .or_else(|| trimmed.strip_prefix("```"))
+        .unwrap_or(trimmed)
         .trim();
+    let cleaned = without_prefix.strip_suffix("```").unwrap_or(without_prefix).trim();
 
     let candidate = if let Some(start) = cleaned.find('{') {
         if let Some(end) = cleaned.rfind('}') {
@@ -254,15 +254,9 @@ fn extract_message_content(value: &serde_json::Value) -> Option<String> {
     })
 }
 
-fn llm_endpoint() -> String {
-    std::env::var("SHIPYARD_LLM_ENDPOINT")
-        .unwrap_or_else(|_| "http://localhost:3000/v1".to_string())
-}
-
-fn resolved_model(model: &str) -> String {
+fn resolved_model(model: &str, config: &Config) -> String {
     if model.trim().is_empty() {
-        std::env::var("SHIPYARD_LLM_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4.5".to_string())
+        config.llm_model.clone()
     } else {
         model.to_string()
     }

@@ -4,6 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 use tracing::warn;
 
+use crate::config::Config;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TaskRecord {
     pub task_id: String,
@@ -20,9 +22,7 @@ pub struct KnowledgeStore {
 
 impl KnowledgeStore {
     pub fn new() -> Self {
-        let base_dir = std::env::var("SHIPYARD_DATA_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("./data"));
+        let base_dir = Config::from_env().data_dir;
         Self { base_dir }
     }
 

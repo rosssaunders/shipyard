@@ -20,7 +20,6 @@ struct ParserState {
     current_stage: Stage,
     files_read: Vec<String>,
     files_written: Vec<String>,
-    last_event_len: usize,
 }
 
 /// Spawn a background task that parses agent output into structured events
@@ -34,7 +33,6 @@ pub fn spawn_log_parser(
             current_stage: Stage::Unknown,
             files_read: Vec::new(),
             files_written: Vec::new(),
-            last_event_len: 0,
         };
         let mut last_len = 0usize;
 

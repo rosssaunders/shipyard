@@ -6,8 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -58,7 +57,7 @@ pub struct SpawnRequest {
 }
 
 pub struct AgentManager {
-    pub(crate) processes: Mutex<HashMap<String, AgentProcess>>,
+    processes: Mutex<HashMap<String, AgentProcess>>,
 }
 
 struct AgentProcess {
@@ -81,11 +80,6 @@ impl AgentManager {
         prompt: &str,
         agent_type: &str,
     ) -> anyhow::Result<u32> {
-        let (cmd, args): (&str, Vec<&str>) = match agent_type {
-            "claude" => ("claude", vec!["-p", prompt, "--dangerously-skip-permissions"]),
-            _ => ("codex", vec!["--yolo", "-m", model, "exec", prompt]),
-        };
-
         // Use script(1) to capture PTY output — Codex needs a terminal
         let log_file = format!("/tmp/shipyard/{id}.log");
         let _ = std::fs::File::create(&log_file);
@@ -229,7 +223,7 @@ pub async fn spawn_agent(
     Json(req): Json<SpawnRequest>,
 ) -> Json<Agent> {
     let id = Uuid::new_v4().to_string();
-    let model = req.model.unwrap_or_else(|| "gpt-5.4".to_string());
+    let model = req.model.unwrap_or_else(|| state.config.llm_model.clone());
     let now = chrono::Utc::now().to_rfc3339();
 
     // Get project info (scope the lock to avoid holding across await)

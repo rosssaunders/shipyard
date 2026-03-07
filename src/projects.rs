@@ -180,7 +180,7 @@ pub async fn generate_skills(
         ci_info = ci_files.iter().take(2).map(|f| f.lines().take(30).collect::<Vec<_>>().join("\n")).collect::<Vec<_>>().join("\n---\n"),
     );
 
-    match crate::brain::call_llm_pub("gpt-5.4", 
+    match crate::brain::call_llm_pub(&state.config.llm_model, 
         "You generate concise project knowledge documents for coding agents. Output raw markdown only, no wrapping.",
         &prompt).await 
     {
