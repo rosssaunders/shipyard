@@ -6,9 +6,9 @@
 //! All external commands run via spawn_blocking to avoid starving
 //! the tokio runtime (which would hang the HTTP server).
 
-use std::sync::Arc;
 use crate::AppState;
 use crate::tasks::{add_event, run_cmd_async, run_cmd_timeout_async};
+use std::sync::Arc;
 
 /// Run quality gates from project skills (not hardcoded)
 pub async fn run_skill_gates(
@@ -22,20 +22,51 @@ pub async fn run_skill_gates(
     let mut results = Vec::new();
 
     for gate in &gates {
-        add_event(state, task_id, "gate", "🧪", &format!("Running: {}", gate.name), None);
+        add_event(
+            state,
+            task_id,
+            "gate",
+            "🧪",
+            &format!("Running: {}", gate.name),
+            None,
+        );
 
         let parts: Vec<&str> = gate.command.split_whitespace().collect();
-        if parts.is_empty() { continue; }
+        if parts.is_empty() {
+            continue;
+        }
 
         let (cmd, args) = (parts[0], &parts[1..]);
         let result = run_cmd_async(worktree, cmd, args).await;
 
         if result.0 {
-            add_event(state, task_id, "gate", "✅", &format!("{} passed", gate.name), None);
-            results.push(GateResult { name: gate.name.clone(), passed: true, output: result.1 });
+            add_event(
+                state,
+                task_id,
+                "gate",
+                "✅",
+                &format!("{} passed", gate.name),
+                None,
+            );
+            results.push(GateResult {
+                name: gate.name.clone(),
+                passed: true,
+                output: result.1,
+            });
         } else {
-            add_event(state, task_id, "gate", "❌", &format!("{} failed", gate.name), Some(&result.1));
-            results.push(GateResult { name: gate.name.clone(), passed: false, output: result.1 });
+            add_event(
+                state,
+                task_id,
+                "gate",
+                "❌",
+                &format!("{} failed", gate.name),
+                Some(&result.1),
+            );
+            results.push(GateResult {
+                name: gate.name.clone(),
+                passed: false,
+                output: result.1,
+            });
         }
     }
 
@@ -52,19 +83,37 @@ pub async fn attempt_fix(
     attempt: u32,
 ) -> bool {
     if attempt > 3 {
-        add_event(state, task_id, "supervisor", "💀",
-            "Supervisor: giving up after 3 fix attempts", None);
+        add_event(
+            state,
+            task_id,
+            "supervisor",
+            "💀",
+            "Supervisor: giving up after 3 fix attempts",
+            None,
+        );
         return false;
     }
 
-    add_event(state, task_id, "supervisor", "🔧",
-        &format!("Supervisor: attempting fix (attempt {})", attempt), None);
+    add_event(
+        state,
+        task_id,
+        "supervisor",
+        "🔧",
+        &format!("Supervisor: attempting fix (attempt {})", attempt),
+        None,
+    );
 
     // Build a targeted fix prompt from the failures
-    let error_context: String = failures.iter()
+    let error_context: String = failures
+        .iter()
         .filter(|f| !f.passed)
-        .map(|f| format!("## {} FAILED\n```\n{}\n```", f.name, 
-            f.output.chars().take(2000).collect::<String>()))
+        .map(|f| {
+            format!(
+                "## {} FAILED\n```\n{}\n```",
+                f.name,
+                f.output.chars().take(2000).collect::<String>()
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -82,24 +131,48 @@ pub async fn attempt_fix(
 
     // Spawn fixer agent (10 min timeout, non-blocking)
     let fix_result = run_cmd_timeout_async(
-        worktree, "codex",
+        worktree,
+        "codex",
         &["--yolo", "-m", model, "exec", &fix_prompt],
         600,
-    ).await;
+    )
+    .await;
 
     // Auto-commit if fixer left uncommitted changes
     let status = run_cmd_async(worktree, "git", &["status", "--porcelain"]).await;
     if status.0 && !status.1.trim().is_empty() {
         let _ = run_cmd_async(worktree, "git", &["add", "-A"]).await;
-        let _ = run_cmd_async(worktree, "git", &["commit", "-m", 
-            &format!("fix: resolve gate failures (attempt {})", attempt)]).await;
+        let _ = run_cmd_async(
+            worktree,
+            "git",
+            &[
+                "commit",
+                "-m",
+                &format!("fix: resolve gate failures (attempt {})", attempt),
+            ],
+        )
+        .await;
     }
 
     if fix_result.0 {
-        add_event(state, task_id, "supervisor", "🔧", "Fixer agent completed", None);
+        add_event(
+            state,
+            task_id,
+            "supervisor",
+            "🔧",
+            "Fixer agent completed",
+            None,
+        );
         true
     } else {
-        add_event(state, task_id, "supervisor", "⚠️", "Fixer agent failed", None);
+        add_event(
+            state,
+            task_id,
+            "supervisor",
+            "⚠️",
+            "Fixer agent failed",
+            None,
+        );
         false
     }
 }
@@ -125,7 +198,8 @@ fn load_project_skills(state: &Arc<AppState>, task_id: &str) -> String {
         "SELECT p.skills FROM projects p JOIN tasks t ON t.project_id = p.id WHERE t.id = ?1",
         [task_id],
         |r| r.get::<_, String>(0),
-    ).unwrap_or_default()
+    )
+    .unwrap_or_default()
 }
 
 /// Parse quality gates from skills markdown
@@ -135,7 +209,9 @@ fn parse_gates_from_skills(skills: &str) -> Vec<Gate> {
 
     for line in skills.lines() {
         let trimmed = line.trim();
-        if trimmed.to_lowercase().contains("quality gate") || trimmed.to_lowercase().contains("## gates") {
+        if trimmed.to_lowercase().contains("quality gate")
+            || trimmed.to_lowercase().contains("## gates")
+        {
             in_gates_section = true;
             continue;
         }
@@ -143,7 +219,10 @@ fn parse_gates_from_skills(skills: &str) -> Vec<Gate> {
             if trimmed.starts_with("## ") || trimmed.starts_with("# ") {
                 break;
             }
-            if let Some(cmd) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+            if let Some(cmd) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
                 let cmd = cmd.trim();
                 if !cmd.is_empty() {
                     let name = if cmd.len() > 40 {
@@ -151,15 +230,24 @@ fn parse_gates_from_skills(skills: &str) -> Vec<Gate> {
                     } else {
                         cmd.to_string()
                     };
-                    gates.push(Gate { name, command: cmd.to_string() });
+                    gates.push(Gate {
+                        name,
+                        command: cmd.to_string(),
+                    });
                 }
             }
         }
     }
 
     if gates.is_empty() {
-        gates.push(Gate { name: "Tests".into(), command: "cargo test".into() });
-        gates.push(Gate { name: "Clippy".into(), command: "cargo clippy --all-targets -- -D warnings".into() });
+        gates.push(Gate {
+            name: "Tests".into(),
+            command: "cargo test".into(),
+        });
+        gates.push(Gate {
+            name: "Clippy".into(),
+            command: "cargo clippy --all-targets -- -D warnings".into(),
+        });
     }
 
     gates

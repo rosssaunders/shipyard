@@ -1,3 +1,4 @@
+use anyhow::{Result, anyhow};
 use axum::{
     Json,
     extract::{Path, State},
@@ -10,6 +11,14 @@ use crate::agents::QualityGates;
 use crate::knowledge::{KnowledgeStore, TaskRecord};
 
 // --- Intent-driven API ---
+
+#[derive(Debug, Clone)]
+pub struct ProjectContext {
+    pub id: String,
+    pub owner: String,
+    pub repo: String,
+    pub default_branch: String,
+}
 
 #[derive(Deserialize)]
 pub struct IntentRequest {
@@ -43,59 +52,105 @@ pub struct ResolveRequest {
     pub action: String, // "approve" or "reject"
 }
 
-/// POST /api/intent — "I want X", brain figures out the rest
-pub async fn submit_intent(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<IntentRequest>,
-) -> Json<serde_json::Value> {
-    // Find the project (use provided or first available)
-    let project = {
-        let conn = state.db.conn();
-        if let Some(pid) = &req.project_id {
-            conn.query_row(
-                "SELECT id, owner, repo FROM projects WHERE id = ?1",
-                [pid.as_str()],
-                |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?)),
-            ).ok()
-        } else {
-            conn.query_row(
-                "SELECT id, owner, repo FROM projects ORDER BY created_at LIMIT 1",
-                [],
-                |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,String>(2)?)),
-            ).ok()
-        }
-    };
+#[derive(Debug, Clone)]
+pub struct LaunchTaskRequest {
+    pub project_id: String,
+    pub issue_number: Option<i64>,
+    pub title: String,
+    pub model: Option<String>,
+    pub agent_type: Option<String>,
+    pub quality_gates: Option<QualityGates>,
+    pub extra_instructions: Option<String>,
+    pub auto_merge: bool,
+}
 
-    let Some((project_id, owner, repo)) = project else {
-        return Json(serde_json::json!({"error": "No project configured"}));
-    };
-
-    // Brain interprets the intent → creates a task
-    let id = uuid::Uuid::new_v4().to_string();
-    let model = state.config.llm_model.clone();
-    let agent_type = "codex".to_string();
-    let now = chrono::Utc::now().to_rfc3339();
-    let worktree_path = format!("/tmp/shipyard/{}/{}", repo, &id[..8]);
-    let issue_number = req.issue_number;
-    let branch = if let Some(n) = issue_number {
-        format!("shipyard/issue-{n}")
+pub fn resolve_project(state: &AppState, project_id: Option<&str>) -> Option<ProjectContext> {
+    let conn = state.db.conn();
+    if let Some(project_id) = project_id {
+        conn.query_row(
+            "SELECT id, owner, repo, default_branch FROM projects WHERE id = ?1",
+            [project_id],
+            |row| {
+                Ok(ProjectContext {
+                    id: row.get(0)?,
+                    owner: row.get(1)?,
+                    repo: row.get(2)?,
+                    default_branch: row.get(3)?,
+                })
+            },
+        )
+        .ok()
     } else {
-        format!("shipyard/{}", &id[..8])
-    };
+        conn.query_row(
+            "SELECT id, owner, repo, default_branch FROM projects ORDER BY created_at LIMIT 1",
+            [],
+            |row| {
+                Ok(ProjectContext {
+                    id: row.get(0)?,
+                    owner: row.get(1)?,
+                    repo: row.get(2)?,
+                    default_branch: row.get(3)?,
+                })
+            },
+        )
+        .ok()
+    }
+}
 
-    // Create worktree
-    let repo_path = format!(
-        "{}/code/{}/{}",
-        std::env::var("HOME").unwrap_or_default(), owner, repo
+pub fn detect_issue_number(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b'#' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end > start {
+                return text[start..end].parse().ok();
+            }
+        }
+        i += 1;
+    }
+
+    let tokens: Vec<&str> = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .collect();
+    for window in tokens.windows(2) {
+        if matches!(window[0], "issue" | "issues" | "ticket" | "tickets")
+            && let Ok(number) = window[1].parse::<i64>()
+        {
+            return Some(number);
+        }
+    }
+
+    None
+}
+
+pub async fn launch_task(state: Arc<AppState>, req: LaunchTaskRequest) -> Result<Task> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let model = req.model.unwrap_or_else(|| state.config.llm_model.clone());
+    let agent_type = req.agent_type.unwrap_or_else(|| "codex".to_string());
+    let gates = req.quality_gates.unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let project = resolve_project(&state, Some(&req.project_id))
+        .ok_or_else(|| anyhow!("project not found"))?;
+
+    let branch = format!(
+        "shipyard/{}",
+        req.issue_number
+            .map(|n| format!("issue-{n}"))
+            .unwrap_or_else(|| id[..8].to_string())
     );
-    let _ = std::fs::create_dir_all(&worktree_path);
-    let default_branch = {
-        let conn = state.db.conn();
-        conn.query_row("SELECT default_branch FROM projects WHERE id = ?1", [&project_id], |r| r.get::<_,String>(0))
-            .unwrap_or_else(|_| "main".to_string())
-    };
+    let worktree_path = format!("/tmp/shipyard/{}/{}", project.repo, &id[..8]);
+    let repo_path = repo_checkout_path(&project.owner, &project.repo);
 
-    // Clean up any stale branch/worktree with the same name
+    let _ = std::fs::create_dir_all(&worktree_path);
+
     let _ = std::process::Command::new("git")
         .args(["worktree", "remove", "--force", &worktree_path])
         .current_dir(&repo_path)
@@ -104,108 +159,174 @@ pub async fn submit_intent(
         .args(["branch", "-D", &branch])
         .current_dir(&repo_path)
         .output();
-    // Also delete remote branch if it exists
     let _ = std::process::Command::new("git")
         .args(["push", "origin", "--delete", &branch, "--no-verify"])
         .current_dir(&repo_path)
         .output();
-
-    // Pull latest before creating worktree
     let _ = std::process::Command::new("git")
         .args(["pull", "--ff-only"])
         .current_dir(&repo_path)
         .output();
-
     let _ = std::process::Command::new("git")
-        .args(["worktree", "add", "-b", &branch, &worktree_path, &default_branch])
+        .args([
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &worktree_path,
+            &project.default_branch,
+        ])
         .current_dir(&repo_path)
         .output();
 
-    // Insert task
     {
         let conn = state.db.conn();
         conn.execute(
             "INSERT INTO tasks (id, project_id, issue_number, title, status, agent_type, model, worktree_path, branch, created_at, auto_merge)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8, ?9, 1)",
-            rusqlite::params![id, project_id, issue_number, req.text, agent_type, model, worktree_path, branch, now],
-        ).unwrap();
+             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                id,
+                req.project_id,
+                req.issue_number,
+                req.title,
+                agent_type,
+                model,
+                worktree_path,
+                branch,
+                now,
+                req.auto_merge
+            ],
+        )?;
     }
 
-    add_event(&state, &id, "brain", "🧠", &format!("Intent received: {}", req.text), None);
+    let task = get_task_from_db(&state, &id).ok_or_else(|| anyhow!("task creation failed"))?;
 
-    // Run pipeline in background
     let bg_state = state.clone();
     let bg_id = id.clone();
     let bg_ctx = TaskPipelineContext {
-        owner,
-        repo,
+        owner: project.owner,
+        repo: project.repo,
         model,
         agent_type,
         branch,
         worktree_path,
-        title: req.text.clone(),
-        issue_number,
-        extra_instructions: None,
-        gates: QualityGates { tests: true, clippy: true, review: true, auto_merge: true },
+        title: task.title.clone(),
+        issue_number: req.issue_number,
+        extra_instructions: req.extra_instructions,
+        gates,
     };
+
     tokio::spawn(async move {
         run_task_pipeline(bg_state, bg_id, bg_ctx).await;
     });
 
-    Json(serde_json::json!({"ok": true, "task_id": id}))
+    Ok(task)
+}
+
+/// POST /api/intent — "I want X", brain figures out the rest
+pub async fn submit_intent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IntentRequest>,
+) -> Json<serde_json::Value> {
+    let Some(project) = resolve_project(&state, req.project_id.as_deref()) else {
+        return Json(serde_json::json!({"error": "No project configured"}));
+    };
+
+    let issue_number = req.issue_number.or_else(|| detect_issue_number(&req.text));
+    match launch_task(
+        state.clone(),
+        LaunchTaskRequest {
+            project_id: project.id,
+            issue_number,
+            title: req.text.clone(),
+            model: None,
+            agent_type: Some("codex".to_string()),
+            quality_gates: Some(QualityGates {
+                tests: true,
+                clippy: true,
+                review: true,
+                auto_merge: true,
+            }),
+            extra_instructions: None,
+            auto_merge: true,
+        },
+    )
+    .await
+    {
+        Ok(task) => {
+            add_event(
+                &state,
+                &task.id,
+                "brain",
+                "🧠",
+                &format!("Intent received: {}", req.text),
+                None,
+            );
+            Json(serde_json::json!({"ok": true, "task_id": task.id}))
+        }
+        Err(err) => Json(serde_json::json!({"error": err.to_string()})),
+    }
 }
 
 /// GET /api/feed — timeline of everything happening
-pub async fn get_feed(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<FeedEvent>> {
+pub async fn get_feed(State(state): State<Arc<AppState>>) -> Json<Vec<FeedEvent>> {
     let conn = state.db.conn();
-    let mut stmt = conn.prepare(
-        "SELECT e.id, e.task_id, e.icon, e.message, e.detail, e.created_at, t.status, p.repo
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id, e.task_id, e.icon, e.message, e.detail, e.created_at, t.status, p.repo
          FROM task_events e
          JOIN tasks t ON t.id = e.task_id
          LEFT JOIN projects p ON p.id = t.project_id
          ORDER BY e.id DESC
-         LIMIT 100"
-    ).unwrap();
+         LIMIT 100",
+        )
+        .unwrap();
 
-    let events: Vec<FeedEvent> = stmt.query_map([], |row| {
-        Ok(FeedEvent {
-            id: row.get::<_, i64>(0)?.to_string(),
-            task_id: row.get(1)?,
-            icon: row.get(2)?,
-            message: row.get(3)?,
-            detail: row.get(4)?,
-            created_at: row.get(5)?,
-            task_status: row.get(6)?,
-            repo: row.get(7)?,
+    let events: Vec<FeedEvent> = stmt
+        .query_map([], |row| {
+            Ok(FeedEvent {
+                id: row.get::<_, i64>(0)?.to_string(),
+                task_id: row.get(1)?,
+                icon: row.get(2)?,
+                message: row.get(3)?,
+                detail: row.get(4)?,
+                created_at: row.get(5)?,
+                task_status: row.get(6)?,
+                repo: row.get(7)?,
+            })
         })
-    }).unwrap().filter_map(|r| r.ok()).collect();
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
 
     Json(events)
 }
 
 /// GET /api/attention — things that need human decision
-pub async fn get_attention(
-    State(state): State<Arc<AppState>>,
-) -> Json<Vec<AttentionItem>> {
+pub async fn get_attention(State(state): State<Arc<AppState>>) -> Json<Vec<AttentionItem>> {
     let conn = state.db.conn();
-    let mut stmt = conn.prepare(
-        "SELECT e.id, e.icon, e.message, e.task_id
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.id, e.icon, e.message, e.task_id
          FROM task_events e
          JOIN tasks t ON t.id = e.task_id
          WHERE e.kind = 'attention' AND e.resolved IS NULL
-         ORDER BY e.id DESC"
-    ).unwrap();
+         ORDER BY e.id DESC",
+        )
+        .unwrap();
 
-    let items: Vec<AttentionItem> = stmt.query_map([], |row| {
-        Ok(AttentionItem {
-            id: row.get::<_, i64>(0)?.to_string(),
-            icon: row.get(1)?,
-            message: row.get(2)?,
-            task_id: row.get(3)?,
+    let items: Vec<AttentionItem> = stmt
+        .query_map([], |row| {
+            Ok(AttentionItem {
+                id: row.get::<_, i64>(0)?.to_string(),
+                icon: row.get(1)?,
+                message: row.get(2)?,
+                task_id: row.get(3)?,
+            })
         })
-    }).unwrap().filter_map(|r| r.ok()).collect();
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
 
     Json(items)
 }
@@ -274,7 +395,14 @@ struct TaskPipelineContext {
 }
 
 /// Add an event to a task's timeline
-pub fn add_event(state: &AppState, task_id: &str, kind: &str, icon: &str, message: &str, detail: Option<&str>) {
+pub fn add_event(
+    state: &AppState,
+    task_id: &str,
+    kind: &str,
+    icon: &str,
+    message: &str,
+    detail: Option<&str>,
+) {
     let _ = state.db.conn().execute(
         "INSERT INTO task_events (task_id, kind, icon, message, detail) VALUES (?1, ?2, ?3, ?4, ?5)",
         rusqlite::params![task_id, kind, icon, message, detail],
@@ -420,92 +548,23 @@ pub async fn create_task(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTaskRequest>,
 ) -> Json<Task> {
-    let id = uuid::Uuid::new_v4().to_string();
-    let model = req.model.unwrap_or_else(|| state.config.llm_model.clone());
-    let agent_type = req.agent_type.unwrap_or_else(|| "codex".to_string());
-    let gates = req.quality_gates.unwrap_or_default();
-    let now = chrono::Utc::now().to_rfc3339();
+    let task = launch_task(
+        state,
+        LaunchTaskRequest {
+            project_id: req.project_id,
+            issue_number: req.issue_number,
+            title: req.title,
+            model: req.model,
+            agent_type: req.agent_type,
+            quality_gates: req.quality_gates,
+            extra_instructions: req.extra_instructions,
+            auto_merge: true,
+        },
+    )
+    .await
+    .unwrap();
 
-    // Get project info
-    let (owner, repo, default_branch) = {
-        let conn = state.db.conn();
-        conn.query_row(
-            "SELECT owner, repo, default_branch FROM projects WHERE id = ?1",
-            [&req.project_id],
-            |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)),
-        )
-        .unwrap()
-    };
-
-    // Create branch and worktree
-    let branch = format!(
-        "shipyard/{}",
-        req.issue_number
-            .map(|n| format!("issue-{n}"))
-            .unwrap_or_else(|| id[..8].to_string())
-    );
-    let worktree_path = format!("/tmp/shipyard/{}/{}", repo, &id[..8]);
-    let repo_path = format!(
-        "{}/code/{}/{}",
-        std::env::var("HOME").unwrap_or_default(),
-        owner,
-        repo
-    );
-
-    let _ = std::fs::create_dir_all(&worktree_path);
-
-    // Clean up stale branch/worktree
-    let _ = std::process::Command::new("git")
-        .args(["worktree", "remove", "--force", &worktree_path])
-        .current_dir(&repo_path).output();
-    let _ = std::process::Command::new("git")
-        .args(["branch", "-D", &branch])
-        .current_dir(&repo_path).output();
-    let _ = std::process::Command::new("git")
-        .args(["push", "origin", "--delete", &branch, "--no-verify"])
-        .current_dir(&repo_path).output();
-    let _ = std::process::Command::new("git")
-        .args(["pull", "--ff-only"])
-        .current_dir(&repo_path).output();
-
-    let _ = std::process::Command::new("git")
-        .args(["worktree", "add", "-b", &branch, &worktree_path, &default_branch])
-        .current_dir(&repo_path)
-        .output();
-
-    // Insert task
-    {
-        let conn = state.db.conn();
-        conn.execute(
-            "INSERT INTO tasks (id, project_id, issue_number, title, status, agent_type, model, worktree_path, branch, created_at, auto_merge)
-             VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6, ?7, ?8, ?9, ?10)",
-            rusqlite::params![id, req.project_id, req.issue_number, req.title, agent_type, model, worktree_path, branch, now, true],
-        ).unwrap();
-    }
-
-    // Return task immediately, run pipeline in background
-    let task = get_task_from_db(&state, &id);
-
-    let bg_state = state.clone();
-    let bg_id = id.clone();
-    let bg_ctx = TaskPipelineContext {
-        owner,
-        repo,
-        model,
-        agent_type,
-        branch,
-        worktree_path,
-        title: req.title.clone(),
-        issue_number: req.issue_number,
-        extra_instructions: req.extra_instructions.clone(),
-        gates,
-    };
-
-    tokio::spawn(async move {
-        run_task_pipeline(bg_state, bg_id, bg_ctx).await;
-    });
-
-    Json(task.unwrap())
+    Json(task)
 }
 
 fn get_task_from_db(state: &AppState, id: &str) -> Option<Task> {
@@ -534,11 +593,18 @@ pub async fn get_live_output(
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Json<serde_json::Value> {
-    let offset: usize = params.get("offset").and_then(|s| s.parse().ok()).unwrap_or(0);
-    
+    let offset: usize = params
+        .get("offset")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
     if let Some(output) = state.agents.get_output(&id) {
         let total = output.len();
-        let chunk = if offset < total { &output[offset..] } else { "" };
+        let chunk = if offset < total {
+            &output[offset..]
+        } else {
+            ""
+        };
         Json(serde_json::json!({
             "output": chunk,
             "offset": total,
@@ -553,10 +619,7 @@ pub async fn get_live_output(
     }
 }
 
-pub async fn kill_task(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Json<bool> {
+pub async fn kill_task(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Json<bool> {
     let killed = state.agents.kill(&id);
     if killed {
         update_task_status(&state, &id, "killed");
@@ -571,7 +634,14 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
     let repo_path = repo_checkout_path(&ctx.owner, &ctx.repo);
     let knowledge_store = KnowledgeStore::new();
 
-    add_event(&state, task_id, "recon", "🔍", "Recon: gathering repo and issue context...", None);
+    add_event(
+        &state,
+        task_id,
+        "recon",
+        "🔍",
+        "Recon: gathering repo and issue context...",
+        None,
+    );
     let recon = crate::recon::run_recon(&ctx.owner, &ctx.repo, ctx.issue_number, &repo_path).await;
     add_event(
         &state,
@@ -600,7 +670,14 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
         ctx.extra_instructions.as_deref(),
     );
 
-    add_event(&state, task_id, "brain", "🧠", "Brain: planning from recon report...", None);
+    add_event(
+        &state,
+        task_id,
+        "brain",
+        "🧠",
+        "Brain: planning from recon report...",
+        None,
+    );
 
     let plan = crate::brain::plan_task(&recon, &planning_knowledge, &ctx.model).await;
     let mut max_wait = std::time::Duration::from_secs(12 * 3600);
@@ -644,7 +721,11 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
             }
 
             if plan.prompt.trim().is_empty() {
-                fallback_prompt(&ctx.title, ctx.issue_number, ctx.extra_instructions.as_deref())
+                fallback_prompt(
+                    &ctx.title,
+                    ctx.issue_number,
+                    ctx.extra_instructions.as_deref(),
+                )
             } else {
                 plan.prompt.clone()
             }
@@ -658,12 +739,22 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
                 &format!("Brain planning failed, using fallback prompt: {e}"),
                 None,
             );
-            fallback_prompt(&ctx.title, ctx.issue_number, ctx.extra_instructions.as_deref())
+            fallback_prompt(
+                &ctx.title,
+                ctx.issue_number,
+                ctx.extra_instructions.as_deref(),
+            )
         }
     };
 
-    add_event(&state, task_id, "dispatch", "🚀",
-        &format!("Dispatching to {} ({})", ctx.agent_type, ctx.model), None);
+    add_event(
+        &state,
+        task_id,
+        "dispatch",
+        "🚀",
+        &format!("Dispatching to {} ({})", ctx.agent_type, ctx.model),
+        None,
+    );
 
     // Spawn agent
     let pid = state
@@ -674,10 +765,20 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
 
     {
         let conn = state.db.conn();
-        let _ = conn.execute("UPDATE tasks SET pid = ?1 WHERE id = ?2", rusqlite::params![pid as i64, task_id]);
+        let _ = conn.execute(
+            "UPDATE tasks SET pid = ?1 WHERE id = ?2",
+            rusqlite::params![pid as i64, task_id],
+        );
     }
 
-    add_event(&state, task_id, "agent", "🔨", "Agent started working...", None);
+    add_event(
+        &state,
+        task_id,
+        "agent",
+        "🔨",
+        "Agent started working...",
+        None,
+    );
 
     // Start log parser — turns raw output into structured stages
     if let Some(output) = state.agents.get_output_arc(task_id) {
@@ -717,22 +818,47 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
         }
     }
 
-    add_event(&state, task_id, "agent", "🔨", "Agent finished coding", None);
+    add_event(
+        &state,
+        task_id,
+        "agent",
+        "🔨",
+        "Agent finished coding",
+        None,
+    );
     update_task_status(&state, task_id, "gates");
 
     // Auto-commit any uncommitted changes the agent left behind
     let status = run_cmd(worktree, "git", &["status", "--porcelain"]);
     if status.0 && !status.1.trim().is_empty() {
-        add_event(&state, task_id, "system", "📝", "Auto-committing uncommitted changes...", None);
+        add_event(
+            &state,
+            task_id,
+            "system",
+            "📝",
+            "Auto-committing uncommitted changes...",
+            None,
+        );
         let _ = run_cmd(worktree, "git", &["add", "-A"]);
         let commit_msg = format!("feat: {}", ctx.title.chars().take(72).collect::<String>());
         let _ = run_cmd(worktree, "git", &["commit", "-m", &commit_msg]);
     }
 
     // Check if there are any commits
-    let has_commits = run_cmd(worktree, "git", &["log", "--oneline", "HEAD", "^main", "--"]);
+    let has_commits = run_cmd(
+        worktree,
+        "git",
+        &["log", "--oneline", "HEAD", "^main", "--"],
+    );
     if !has_commits.0 || has_commits.1.trim().is_empty() {
-        add_event(&state, task_id, "error", "⚠️", "No commits produced by agent", None);
+        add_event(
+            &state,
+            task_id,
+            "error",
+            "⚠️",
+            "No commits produced by agent",
+            None,
+        );
         update_task_status(&state, task_id, "failed");
         persist_task_outcome(
             &knowledge_store,
@@ -748,8 +874,14 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
     }
 
     let commit_count = has_commits.1.trim().lines().count();
-    add_event(&state, task_id, "info", "📝",
-        &format!("{commit_count} commit(s) ready"), None);
+    add_event(
+        &state,
+        task_id,
+        "info",
+        "📝",
+        &format!("{commit_count} commit(s) ready"),
+        None,
+    );
 
     // Run quality gates from project skills (Layer 1: Supervisor)
     let mut attempt = 0u32;
@@ -763,14 +895,29 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
         }
 
         // Supervisor: attempt to fix
-        add_event(&state, task_id, "supervisor", "🔧",
-            &format!("Supervisor: {} gate(s) failed, dispatching fixer (attempt {})",
-                failures.len(), attempt), None);
+        add_event(
+            &state,
+            task_id,
+            "supervisor",
+            "🔧",
+            &format!(
+                "Supervisor: {} gate(s) failed, dispatching fixer (attempt {})",
+                failures.len(),
+                attempt
+            ),
+            None,
+        );
 
         let failed_results: Vec<_> = results.into_iter().filter(|r| !r.passed).collect();
         let fixed = crate::supervisor::attempt_fix(
-            &state, task_id, worktree, &failed_results, &ctx.model, attempt,
-        ).await;
+            &state,
+            task_id,
+            worktree,
+            &failed_results,
+            &ctx.model,
+            attempt,
+        )
+        .await;
 
         if !fixed {
             break false;
@@ -780,16 +927,37 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
         let status = run_cmd(worktree, "git", &["status", "--porcelain"]);
         if status.0 && !status.1.trim().is_empty() {
             let _ = run_cmd(worktree, "git", &["add", "-A"]);
-            let _ = run_cmd(worktree, "git", &["commit", "-m",
-                &format!("fix: resolve gate failures (attempt {attempt})")]);
+            let _ = run_cmd(
+                worktree,
+                "git",
+                &[
+                    "commit",
+                    "-m",
+                    &format!("fix: resolve gate failures (attempt {attempt})"),
+                ],
+            );
         }
 
-        add_event(&state, task_id, "supervisor", "🔄", "Re-running gates...", None);
+        add_event(
+            &state,
+            task_id,
+            "supervisor",
+            "🔄",
+            "Re-running gates...",
+            None,
+        );
     };
 
     if !all_passed {
         update_task_status(&state, task_id, "failed");
-        add_event(&state, task_id, "supervisor", "❌", "Supervisor: gates failed after all fix attempts", None);
+        add_event(
+            &state,
+            task_id,
+            "supervisor",
+            "❌",
+            "Supervisor: gates failed after all fix attempts",
+            None,
+        );
         persist_task_outcome(
             &knowledge_store,
             &state,
@@ -804,7 +972,14 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
     }
 
     if ctx.gates.review {
-        add_event(&state, task_id, "review", "🧠", "Brain: reviewing diff...", None);
+        add_event(
+            &state,
+            task_id,
+            "review",
+            "🧠",
+            "Brain: reviewing diff...",
+            None,
+        );
         let diff = capture_task_diff(worktree);
         if diff.trim().is_empty() {
             add_event(
@@ -823,7 +998,14 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
                     } else {
                         format!("{}\n\n{}", review.summary, review.issues.join("\n"))
                     };
-                    add_event(&state, task_id, "review", "✅", "Brain review approved", Some(&detail));
+                    add_event(
+                        &state,
+                        task_id,
+                        "review",
+                        "✅",
+                        "Brain review approved",
+                        Some(&detail),
+                    );
                 }
                 Ok(review) => {
                     let mut detail = review.summary;
@@ -835,7 +1017,14 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
                         detail.push_str("\n\nSuggestion:\n");
                         detail.push_str(&suggestion);
                     }
-                    add_event(&state, task_id, "review", "❌", "Brain review rejected the diff", Some(&detail));
+                    add_event(
+                        &state,
+                        task_id,
+                        "review",
+                        "❌",
+                        "Brain review rejected the diff",
+                        Some(&detail),
+                    );
                     update_task_status(&state, task_id, "failed");
                     persist_task_outcome(
                         &knowledge_store,
@@ -865,9 +1054,20 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
 
     // Push and create PR
     add_event(&state, task_id, "system", "🚀", "Pushing branch...", None);
-    let push = run_cmd(worktree, "git", &["push", "-u", "origin", &ctx.branch, "--no-verify"]);
+    let push = run_cmd(
+        worktree,
+        "git",
+        &["push", "-u", "origin", &ctx.branch, "--no-verify"],
+    );
     if !push.0 {
-        add_event(&state, task_id, "error", "❌", "Failed to push branch", Some(&push.1));
+        add_event(
+            &state,
+            task_id,
+            "error",
+            "❌",
+            "Failed to push branch",
+            Some(&push.1),
+        );
         update_task_status(&state, task_id, "failed");
         persist_task_outcome(
             &knowledge_store,
@@ -882,44 +1082,92 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
         return;
     }
 
-    let pr_title = ctx.issue_number
+    let pr_title = ctx
+        .issue_number
         .map(|n| format!("fix: resolve issue #{n}"))
         .unwrap_or_else(|| format!("shipyard: {}", &task_id[..8]));
     let pr_body = format!(
         "Automated by [Shipyard](https://github.com/rosssaunders/shipyard)\n\n{}",
-        ctx.issue_number.map(|n| format!("Closes #{n}")).unwrap_or_default()
+        ctx.issue_number
+            .map(|n| format!("Closes #{n}"))
+            .unwrap_or_default()
     );
 
-    let pr = run_cmd(worktree, "gh", &[
-        "pr", "create",
-        "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
-        "--head", &ctx.branch,
-        "--title", &pr_title,
-        "--body", &pr_body,
-    ]);
+    let pr = run_cmd(
+        worktree,
+        "gh",
+        &[
+            "pr",
+            "create",
+            "--repo",
+            &format!("{}/{}", ctx.owner, ctx.repo),
+            "--head",
+            &ctx.branch,
+            "--title",
+            &pr_title,
+            "--body",
+            &pr_body,
+        ],
+    );
 
     if pr.0 {
         let pr_url = pr.1.trim();
-        add_event(&state, task_id, "pr", "🔗", &format!("PR created: {pr_url}"), None);
+        add_event(
+            &state,
+            task_id,
+            "pr",
+            "🔗",
+            &format!("PR created: {pr_url}"),
+            None,
+        );
     } else {
-        add_event(&state, task_id, "error", "⚠️", "Failed to create PR", Some(&pr.1));
+        add_event(
+            &state,
+            task_id,
+            "error",
+            "⚠️",
+            "Failed to create PR",
+            Some(&pr.1),
+        );
     }
 
     // Brain merges — gates passed + reviewer approved
-    add_event(&state, task_id, "brain", "🧠", "Brain: all gates green, reviewer approved → merging", None);
+    add_event(
+        &state,
+        task_id,
+        "brain",
+        "🧠",
+        "Brain: all gates green, reviewer approved → merging",
+        None,
+    );
 
     // Always merge if gates pass (brain decides, not the user)
     {
         add_event(&state, task_id, "system", "🔀", "Auto-merging...", None);
-        let merge = run_cmd(worktree, "gh", &[
-            "pr", "merge",
-            "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
-            "--squash", "--admin", &ctx.branch,
-        ]);
+        let merge = run_cmd(
+            worktree,
+            "gh",
+            &[
+                "pr",
+                "merge",
+                "--repo",
+                &format!("{}/{}", ctx.owner, ctx.repo),
+                "--squash",
+                "--admin",
+                &ctx.branch,
+            ],
+        );
         if merge.0 {
             add_event(&state, task_id, "system", "✅", "Merged to main", None);
         } else {
-            add_event(&state, task_id, "error", "⚠️", "Auto-merge failed", Some(&merge.1));
+            add_event(
+                &state,
+                task_id,
+                "error",
+                "⚠️",
+                "Auto-merge failed",
+                Some(&merge.1),
+            );
         }
     }
 
@@ -937,7 +1185,7 @@ async fn run_task_pipeline(state: Arc<AppState>, id: String, ctx: TaskPipelineCo
     .await;
 }
 
-fn repo_checkout_path(owner: &str, repo: &str) -> String {
+pub fn repo_checkout_path(owner: &str, repo: &str) -> String {
     format!(
         "{}/code/{}/{}",
         std::env::var("HOME").unwrap_or_default(),
@@ -946,7 +1194,11 @@ fn repo_checkout_path(owner: &str, repo: &str) -> String {
     )
 }
 
-fn fallback_prompt(title: &str, issue_number: Option<i64>, extra_instructions: Option<&str>) -> String {
+fn fallback_prompt(
+    title: &str,
+    issue_number: Option<i64>,
+    extra_instructions: Option<&str>,
+) -> String {
     let mut prompt = if let Some(issue_num) = issue_number {
         format!(
             "Fix issue #{issue_num}: {title}. Use `gh issue view {issue_num}` for full context. Implement the fix, run the relevant tests, commit, and push."
@@ -1058,14 +1310,35 @@ async fn persist_task_outcome(
     };
 
     if extract_learnings {
-        add_event(state, task_id, "brain", "📚", "Brain: extracting learnings...", None);
+        add_event(
+            state,
+            task_id,
+            "brain",
+            "📚",
+            "Brain: extracting learnings...",
+            None,
+        );
         match crate::brain::extract_learnings(task_id, outcome, &diff, &ctx.model).await {
             Ok(learnings) if !learnings.trim().is_empty() => {
                 knowledge_store.append_knowledge(&ctx.owner, &ctx.repo, &learnings);
-                add_event(state, task_id, "brain", "📚", "Knowledge updated", Some(&learnings));
+                add_event(
+                    state,
+                    task_id,
+                    "brain",
+                    "📚",
+                    "Knowledge updated",
+                    Some(&learnings),
+                );
             }
             Ok(_) => {
-                add_event(state, task_id, "brain", "📚", "No durable learnings extracted", None);
+                add_event(
+                    state,
+                    task_id,
+                    "brain",
+                    "📚",
+                    "No durable learnings extracted",
+                    None,
+                );
             }
             Err(err) => {
                 add_event(
@@ -1093,7 +1366,12 @@ async fn persist_task_outcome(
 }
 
 /// Non-blocking version with actual timeout
-pub async fn run_cmd_timeout_async(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
+pub async fn run_cmd_timeout_async(
+    workdir: &str,
+    cmd: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> (bool, String) {
     let workdir = workdir.to_string();
     let cmd = cmd.to_string();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -1104,14 +1382,21 @@ pub async fn run_cmd_timeout_async(workdir: &str, cmd: &str, args: &[&str], time
     match tokio::time::timeout(
         std::time::Duration::from_secs(timeout_secs + 10), // grace period
         result,
-    ).await {
+    )
+    .await
+    {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => (false, format!("spawn_blocking failed: {e}")),
         Err(_) => (false, format!("Command timed out after {timeout_secs}s")),
     }
 }
 
-fn run_cmd_timeout_sync(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u64) -> (bool, String) {
+fn run_cmd_timeout_sync(
+    workdir: &str,
+    cmd: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> (bool, String) {
     match std::process::Command::new(cmd)
         .args(args)
         .current_dir(workdir)
@@ -1124,11 +1409,14 @@ fn run_cmd_timeout_sync(workdir: &str, cmd: &str, args: &[&str], timeout_secs: u
             loop {
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        let output = child.wait_with_output().unwrap_or_else(|_| std::process::Output {
-                            status,
-                            stdout: Vec::new(),
-                            stderr: Vec::new(),
-                        });
+                        let output =
+                            child
+                                .wait_with_output()
+                                .unwrap_or_else(|_| std::process::Output {
+                                    status,
+                                    stdout: Vec::new(),
+                                    stderr: Vec::new(),
+                                });
                         let stdout = String::from_utf8_lossy(&output.stdout);
                         let stderr = String::from_utf8_lossy(&output.stderr);
                         return (output.status.success(), format!("{stdout}\n{stderr}"));

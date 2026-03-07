@@ -38,11 +38,18 @@ pub struct QualityGates {
     pub auto_merge: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl Default for QualityGates {
     fn default() -> Self {
-        Self { tests: true, clippy: true, review: true, auto_merge: false }
+        Self {
+            tests: true,
+            clippy: true,
+            review: true,
+            auto_merge: false,
+        }
     }
 }
 
@@ -95,9 +102,16 @@ impl AgentManager {
 
         // Wrap command in script(1) to allocate a PTY and capture all output
         let full_cmd = if agent_type == "claude" {
-            format!("claude -p '{}' --dangerously-skip-permissions", prompt.replace('\'', "'\\''"))
+            format!(
+                "claude -p '{}' --dangerously-skip-permissions",
+                prompt.replace('\'', "'\\''")
+            )
         } else {
-            format!("codex --yolo -m {} exec '{}'", model, prompt.replace('\'', "'\\''"))
+            format!(
+                "codex --yolo -m {} exec '{}'",
+                model,
+                prompt.replace('\'', "'\\''")
+            )
         };
 
         let mut child = Command::new("script")
@@ -187,7 +201,9 @@ impl AgentManager {
 
     pub fn kill(&self, id: &str) -> bool {
         if let Some(process) = self.processes.lock().unwrap().get(id) {
-            process.finished.store(true, std::sync::atomic::Ordering::Relaxed);
+            process
+                .finished
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             // Kill the process group
             let _ = std::process::Command::new("pkill")
                 .args(["-f", &format!("shipyard/{}", id)])
@@ -210,7 +226,8 @@ fn strip_ansi(s: &str) -> String {
                 chars.next(); // consume '['
                 while let Some(&nc) = chars.peek() {
                     chars.next();
-                    if nc.is_ascii_alphabetic() || nc == 'm' || nc == 'H' || nc == 'J' || nc == 'K' {
+                    if nc.is_ascii_alphabetic() || nc == 'm' || nc == 'H' || nc == 'J' || nc == 'K'
+                    {
                         break;
                     }
                 }
@@ -286,7 +303,10 @@ pub async fn spawn_agent(
         (owner, repo, default_branch, worktree_path, branch)
     };
 
-    let agent_type = req.agent_type.clone().unwrap_or_else(|| "codex".to_string());
+    let agent_type = req
+        .agent_type
+        .clone()
+        .unwrap_or_else(|| "codex".to_string());
     let gates = req.quality_gates.clone().unwrap_or_default();
 
     // Spawn the coding agent
@@ -402,20 +422,14 @@ pub async fn get_agent(
     Json(agent)
 }
 
-pub async fn get_agent_logs(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> String {
+pub async fn get_agent_logs(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> String {
     state
         .agents
         .get_output(&id)
         .unwrap_or_else(|| "(no output)".to_string())
 }
 
-pub async fn kill_agent(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Json<bool> {
+pub async fn kill_agent(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Json<bool> {
     let killed = state.agents.kill(&id);
     if killed {
         let _ = state.db.conn().execute(
@@ -428,11 +442,7 @@ pub async fn kill_agent(
 
 // --- Quality gate pipeline ---
 
-async fn watch_agent_completion(
-    state: Arc<AppState>,
-    agent_id: &str,
-    ctx: AgentCompletionContext,
-) {
+async fn watch_agent_completion(state: Arc<AppState>, agent_id: &str, ctx: AgentCompletionContext) {
     // Poll until agent process finishes
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -484,44 +494,74 @@ async fn watch_agent_completion(
         record_gate(&state, &gate_id, agent_id, "tests", "running");
         let output = run_command(&ctx.worktree, "cargo", &["test"]);
         let passed = output.0;
-        record_gate_result(&state, &gate_id, if passed { "passed" } else { "failed" }, &output.1);
-        if !passed { all_passed = false; }
+        record_gate_result(
+            &state,
+            &gate_id,
+            if passed { "passed" } else { "failed" },
+            &output.1,
+        );
+        if !passed {
+            all_passed = false;
+        }
     }
 
     // Gate 2: Clippy
     if ctx.gates.clippy && all_passed {
         let gate_id = uuid::Uuid::new_v4().to_string();
         record_gate(&state, &gate_id, agent_id, "clippy", "running");
-        let output = run_command(&ctx.worktree, "cargo", &["clippy", "--all-targets", "--", "-D", "warnings"]);
+        let output = run_command(
+            &ctx.worktree,
+            "cargo",
+            &["clippy", "--all-targets", "--", "-D", "warnings"],
+        );
         let passed = output.0;
-        record_gate_result(&state, &gate_id, if passed { "passed" } else { "failed" }, &output.1);
-        if !passed { all_passed = false; }
+        record_gate_result(
+            &state,
+            &gate_id,
+            if passed { "passed" } else { "failed" },
+            &output.1,
+        );
+        if !passed {
+            all_passed = false;
+        }
     }
 
     // Gate 3: Create PR
     if all_passed {
-        let title = ctx.issue_number
+        let title = ctx
+            .issue_number
             .map(|n| format!("fix: resolve issue #{n}"))
             .unwrap_or_else(|| format!("shipyard: agent {}", &agent_id[..8]));
 
         let body = format!(
             "Automated by [Shipyard](https://github.com/rosssaunders/shipyard)\n\n{}",
-            ctx.issue_number.map(|n| format!("Closes #{n}")).unwrap_or_default()
+            ctx.issue_number
+                .map(|n| format!("Closes #{n}"))
+                .unwrap_or_default()
         );
 
         // Push branch
-        let _ = run_command(&ctx.worktree, "git", &["push", "-u", "origin", &ctx.branch, "--no-verify"]);
+        let _ = run_command(
+            &ctx.worktree,
+            "git",
+            &["push", "-u", "origin", &ctx.branch, "--no-verify"],
+        );
 
         // Create PR
         let pr_output = run_command(
             &ctx.worktree,
             "gh",
             &[
-                "pr", "create",
-                "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
-                "--head", &ctx.branch,
-                "--title", &title,
-                "--body", &body,
+                "pr",
+                "create",
+                "--repo",
+                &format!("{}/{}", ctx.owner, ctx.repo),
+                "--head",
+                &ctx.branch,
+                "--title",
+                &title,
+                "--body",
+                &body,
             ],
         );
 
@@ -533,7 +573,13 @@ async fn watch_agent_completion(
             let review_output = run_command(
                 &ctx.worktree,
                 "gh",
-                &["pr", "diff", "--repo", &format!("{}/{}", ctx.owner, ctx.repo), &ctx.branch],
+                &[
+                    "pr",
+                    "diff",
+                    "--repo",
+                    &format!("{}/{}", ctx.owner, ctx.repo),
+                    &ctx.branch,
+                ],
             );
             // For now, mark review as passed if PR was created
             // TODO: dispatch to small model for actual review
@@ -548,9 +594,12 @@ async fn watch_agent_completion(
                 &ctx.worktree,
                 "gh",
                 &[
-                    "pr", "merge",
-                    "--repo", &format!("{}/{}", ctx.owner, ctx.repo),
-                    "--squash", "--admin",
+                    "pr",
+                    "merge",
+                    "--repo",
+                    &format!("{}/{}", ctx.owner, ctx.repo),
+                    "--squash",
+                    "--admin",
                     &ctx.branch,
                 ],
             );

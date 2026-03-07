@@ -27,7 +27,9 @@ pub struct AddProjectRequest {
 pub async fn list_projects(State(state): State<Arc<AppState>>) -> Json<Vec<Project>> {
     let conn = state.db.conn();
     let mut stmt = conn
-        .prepare("SELECT id, owner, repo, default_branch, created_at FROM projects ORDER BY created_at")
+        .prepare(
+            "SELECT id, owner, repo, default_branch, created_at FROM projects ORDER BY created_at",
+        )
         .unwrap();
 
     let projects = stmt
@@ -110,7 +112,9 @@ pub async fn get_skills(
 ) -> Json<serde_json::Value> {
     let conn = state.db.conn();
     let skills: String = conn
-        .query_row("SELECT skills FROM projects WHERE id = ?1", [&id], |r| r.get(0))
+        .query_row("SELECT skills FROM projects WHERE id = ?1", [&id], |r| {
+            r.get(0)
+        })
         .unwrap_or_default();
     Json(serde_json::json!({"skills": skills}))
 }
@@ -147,7 +151,9 @@ pub async fn generate_skills(
 
     let repo_path = format!(
         "{}/code/{}/{}",
-        std::env::var("HOME").unwrap_or_default(), owner, repo
+        std::env::var("HOME").unwrap_or_default(),
+        owner,
+        repo
     );
 
     // Read AGENTS.md if it exists
@@ -177,13 +183,20 @@ pub async fn generate_skills(
         ## CI workflows\n{ci_info}\n\n\
         Keep it under 2000 words. Be specific and actionable.",
         cargo_first = cargo_toml.lines().take(50).collect::<Vec<_>>().join("\n"),
-        ci_info = ci_files.iter().take(2).map(|f| f.lines().take(30).collect::<Vec<_>>().join("\n")).collect::<Vec<_>>().join("\n---\n"),
+        ci_info = ci_files
+            .iter()
+            .take(2)
+            .map(|f| f.lines().take(30).collect::<Vec<_>>().join("\n"))
+            .collect::<Vec<_>>()
+            .join("\n---\n"),
     );
 
-    match crate::brain::call_llm_pub(&state.config.llm_model, 
+    match crate::brain::call_llm_pub(
+        &state.config.llm_model,
         "You generate concise project knowledge documents for coding agents. Output raw markdown only, no wrapping.",
-        &prompt).await 
-    {
+        &prompt,
+    )
+    .await {
         Ok(skills) => {
             // Save to DB
             let conn = state.db.conn();
@@ -217,11 +230,16 @@ pub async fn list_issues(
     // Use gh CLI to fetch issues (authenticated already)
     let output = std::process::Command::new("gh")
         .args([
-            "issue", "list",
-            "--repo", &format!("{owner}/{repo}"),
-            "--state", "open",
-            "--limit", "50",
-            "--json", "number,title,labels,assignees,state,createdAt,updatedAt,milestone",
+            "issue",
+            "list",
+            "--repo",
+            &format!("{owner}/{repo}"),
+            "--state",
+            "open",
+            "--limit",
+            "50",
+            "--json",
+            "number,title,labels,assignees,state,createdAt,updatedAt,milestone",
         ])
         .output();
 

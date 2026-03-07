@@ -1,11 +1,12 @@
-mod config;
-mod db;
 mod agents;
 mod brain;
+mod chat;
+mod config;
+mod db;
 mod knowledge;
-mod recon;
 mod log_parser;
 mod projects;
+mod recon;
 mod supervisor;
 mod tasks;
 mod ws;
@@ -14,9 +15,9 @@ use axum::{
     Router,
     routing::{get, post},
 };
+use std::sync::Arc;
 use tower_http::services::ServeDir;
 use tracing_subscriber::EnvFilter;
-use std::sync::Arc;
 
 use crate::config::Config;
 
@@ -47,6 +48,8 @@ async fn main() -> anyhow::Result<()> {
         // New intent-driven API
         .route("/api/intent", post(tasks::submit_intent))
         .route("/api/feed", get(tasks::get_feed))
+        .route("/api/chat", post(chat::send_message))
+        .route("/api/chat/history", get(chat::get_history))
         .route("/api/attention", get(tasks::get_attention))
         .route("/api/attention/:id", post(tasks::resolve_attention))
         // Projects
@@ -56,7 +59,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/projects/:id/issues", get(projects::list_issues))
         .route("/api/projects/:id/skills", get(projects::get_skills))
         .route("/api/projects/:id/skills", post(projects::update_skills))
-        .route("/api/projects/:id/skills/generate", post(projects::generate_skills))
+        .route(
+            "/api/projects/:id/skills/generate",
+            post(projects::generate_skills),
+        )
         .route("/api/projects/:id/agents", get(agents::list_agents))
         // Live output
         .route("/api/tasks/:id/output", get(tasks::get_live_output))
@@ -74,8 +80,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/ws", get(ws::ws_handler))
         .with_state(state.clone());
 
-    let app = api
-        .fallback_service(ServeDir::new("www"));
+    let app = api.fallback_service(ServeDir::new("www"));
 
     let addr = format!("0.0.0.0:{}", config.port);
     tracing::info!("⚓ Shipyard listening on {addr}");

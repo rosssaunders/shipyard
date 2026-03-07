@@ -9,10 +9,7 @@ use std::sync::Arc;
 
 use crate::AppState;
 
-pub async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> Response {
+pub async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
@@ -22,9 +19,7 @@ async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
         "type": "connected",
         "message": "⚓ Welcome to Shipyard"
     });
-    let _ = socket
-        .send(Message::Text(welcome.to_string()))
-        .await;
+    let _ = socket.send(Message::Text(welcome.to_string())).await;
 
     // Handle incoming messages
     while let Some(Ok(msg)) = socket.recv().await {
@@ -33,9 +28,7 @@ async fn handle_socket(mut socket: WebSocket, _state: Arc<AppState>) {
                 let text_str: &str = &text;
                 if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(text_str) {
                     let response = handle_command(cmd).await;
-                    let _ = socket
-                        .send(Message::Text(response.to_string()))
-                        .await;
+                    let _ = socket.send(Message::Text(response.to_string())).await;
                 }
             }
             Message::Close(_) => break,

@@ -7,6 +7,12 @@ use crate::config::Config;
 use crate::recon::ReconReport;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct LlmMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct TaskPlan {
     pub assessment: String,
     pub complexity: u8,
@@ -23,13 +29,9 @@ pub struct ReviewResult {
     pub suggestion: Option<String>,
 }
 
-pub async fn plan_task(
-    recon: &ReconReport,
-    knowledge: &str,
-    model: &str,
-) -> Result<TaskPlan> {
-    let recon_json = serde_json::to_string_pretty(recon)
-        .context("failed to serialize recon report")?;
+pub async fn plan_task(recon: &ReconReport, knowledge: &str, model: &str) -> Result<TaskPlan> {
+    let recon_json =
+        serde_json::to_string_pretty(recon).context("failed to serialize recon report")?;
 
     let system_prompt = format!(
         r#"You are Shipyard Brain V2, an AI engineering manager that plans work for coding agents.
@@ -86,8 +88,8 @@ pub async fn review_diff(
     knowledge: &str,
     model: &str,
 ) -> Result<ReviewResult> {
-    let recon_json = serde_json::to_string_pretty(recon)
-        .context("failed to serialize recon report")?;
+    let recon_json =
+        serde_json::to_string_pretty(recon).context("failed to serialize recon report")?;
 
     let system_prompt = format!(
         r#"You are Shipyard Brain V2 acting as a reviewer.
@@ -138,9 +140,8 @@ Return concise markdown only. Focus on:
 
 If there is nothing durable to save, return an empty string."#;
 
-    let user_prompt = format!(
-        "Task ID: {task_id}\nOutcome: {outcome}\n\nDiff:\n```diff\n{diff}\n```"
-    );
+    let user_prompt =
+        format!("Task ID: {task_id}\nOutcome: {outcome}\n\nDiff:\n```diff\n{diff}\n```");
 
     let response = call_llm(model, system_prompt, &user_prompt, None).await?;
     Ok(response.trim().to_string())
@@ -150,20 +151,36 @@ pub async fn call_llm_pub(model: &str, system: &str, user: &str) -> Result<Strin
     call_llm(model, system, user, None).await
 }
 
+pub async fn call_llm_messages_pub(model: &str, messages: &[LlmMessage]) -> Result<String> {
+    call_llm_messages(model, messages, None).await
+}
+
 async fn call_llm_json(model: &str, system: &str, user: &str) -> Result<String> {
-    call_llm(
-        model,
-        system,
-        user,
-        Some(json!({ "type": "json_object" })),
-    )
-    .await
+    call_llm(model, system, user, Some(json!({ "type": "json_object" }))).await
 }
 
 async fn call_llm(
     model: &str,
     system: &str,
     user: &str,
+    response_format: Option<serde_json::Value>,
+) -> Result<String> {
+    let messages = vec![
+        LlmMessage {
+            role: "system".to_string(),
+            content: system.to_string(),
+        },
+        LlmMessage {
+            role: "user".to_string(),
+            content: user.to_string(),
+        },
+    ];
+    call_llm_messages(model, &messages, response_format).await
+}
+
+async fn call_llm_messages(
+    model: &str,
+    messages: &[LlmMessage],
     response_format: Option<serde_json::Value>,
 ) -> Result<String> {
     let config = Config::from_env();
@@ -174,10 +191,7 @@ async fn call_llm(
 
     let mut body = json!({
         "model": model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user }
-        ]
+        "messages": messages
     });
 
     if let Some(format) = response_format {
@@ -185,9 +199,7 @@ async fn call_llm(
     }
 
     let client = reqwest::Client::new();
-    let mut request = client
-        .post(&url)
-        .header("Content-Type", "application/json");
+    let mut request = client.post(&url).header("Content-Type", "application/json");
 
     if !api_key.is_empty() {
         request = request.header("Authorization", format!("Bearer {api_key}"));
@@ -224,7 +236,10 @@ where
         .or_else(|| trimmed.strip_prefix("```"))
         .unwrap_or(trimmed)
         .trim();
-    let cleaned = without_prefix.strip_suffix("```").unwrap_or(without_prefix).trim();
+    let cleaned = without_prefix
+        .strip_suffix("```")
+        .unwrap_or(without_prefix)
+        .trim();
 
     let candidate = if let Some(start) = cleaned.find('{') {
         if let Some(end) = cleaned.rfind('}') {

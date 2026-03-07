@@ -52,11 +52,7 @@ impl KnowledgeStore {
             current.push_str("\n\n");
         }
 
-        current.push_str(&format!(
-            "## {}\n{}\n",
-            Utc::now().to_rfc3339(),
-            trimmed
-        ));
+        current.push_str(&format!("## {}\n{}\n", Utc::now().to_rfc3339(), trimmed));
 
         if let Err(err) = fs::write(&path, current) {
             warn!(file = %path.display(), error = %err, "failed to append knowledge");
@@ -96,9 +92,11 @@ impl KnowledgeStore {
     }
 
     fn project_dir(&self, owner: &str, repo: &str) -> PathBuf {
-        self.base_dir
-            .join("projects")
-            .join(format!("{}_{}", sanitize_segment(owner), sanitize_segment(repo)))
+        self.base_dir.join("projects").join(format!(
+            "{}_{}",
+            sanitize_segment(owner),
+            sanitize_segment(repo)
+        ))
     }
 
     fn ensure_project_dir(&self, owner: &str, repo: &str) -> PathBuf {
@@ -127,6 +125,12 @@ impl KnowledgeStore {
 fn sanitize_segment(value: &str) -> String {
     value
         .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
         .collect()
 }

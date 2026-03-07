@@ -54,15 +54,7 @@ pub async fn run_recon(
     let tree_fut = fetch_file_tree(repo_path);
     let key_files_fut = read_key_files(repo_path);
 
-    let (
-        issue,
-        related_prs,
-        existing_branch,
-        recent_commits,
-        baseline_tests,
-        file_tree,
-        key_files,
-    ) = tokio::join!(
+    let (issue, related_prs, existing_branch, recent_commits, baseline_tests, file_tree, key_files) = tokio::join!(
         issue_fut,
         related_prs_fut,
         branch_fut,
@@ -235,11 +227,7 @@ async fn read_key_files(repo_path: &str) -> Vec<(String, String)> {
         let path = format!("{repo_path}/{name}");
         match fs::read_to_string(&path).await {
             Ok(contents) => {
-                let snippet = contents
-                    .lines()
-                    .take(200)
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let snippet = contents.lines().take(200).collect::<Vec<_>>().join("\n");
                 files.push((name.to_string(), snippet));
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -263,7 +251,9 @@ fn detect_possible_fix(
         return false;
     }
 
-    let commit_hit = recent_commits.iter().any(|commit| matches_keywords(commit, &keywords));
+    let commit_hit = recent_commits
+        .iter()
+        .any(|commit| matches_keywords(commit, &keywords));
     let pr_hit = related_prs.iter().any(|pr| {
         matches_keywords(&pr.title, &keywords) || matches_keywords(&pr.head_ref_name, &keywords)
     });
@@ -334,12 +324,8 @@ async fn run_shell_command(script: &str, cwd: Option<&str>) -> Option<ShellOutpu
     match command.output().await {
         Ok(output) => Some(ShellOutput {
             status: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .to_string(),
+            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         }),
         Err(err) => {
             warn!(error = %err, "failed to run shell command during recon");

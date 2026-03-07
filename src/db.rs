@@ -82,9 +82,19 @@ impl Database {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id TEXT,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                actions TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_events_task ON task_events(task_id);
+            CREATE INDEX IF NOT EXISTS idx_chat_project ON chat_messages(project_id, id DESC);
             ",
         )?;
         Ok(())
