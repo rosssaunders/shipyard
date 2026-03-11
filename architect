@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# Shipyard Architect — plans, delegates, reviews. Never codes.
+#
+# Usage:
+#   ./architect "Fix the race condition in ws.rs"
+#   ./architect                     # interactive mode
+#   ./architect --issue 42          # work on a GitHub issue
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROMPT_FILE="$SCRIPT_DIR/scripts/architect-prompt.md"
+SYSTEM_PROMPT="$(cat "$PROMPT_FILE")"
+
+# Ensure scratch dir exists
+mkdir -p /tmp/shipyard
+
+# Tools the architect is DENIED — anything that writes code
+DENIED_TOOLS="Edit,Write,NotebookEdit"
+
+# If an argument is given, run in one-shot mode (-p)
+# Otherwise, run interactively
+if [[ $# -gt 0 ]]; then
+    # Collect all args as the task description
+    if [[ "$1" == "--issue" && -n "${2:-}" ]]; then
+        ISSUE_NUM="$2"
+        shift 2
+        TASK="$(gh issue view "$ISSUE_NUM" --json title,body,labels,comments --jq '
+            "# Issue #'" + "$ISSUE_NUM" + '\n" +
+            "## " + .title + "\n\n" +
+            .body + "\n\n" +
+            "## Labels: " + ([.labels[].name] | join(", ")) + "\n\n" +
+            "## Comments:\n" +
+            ([.comments[] | "**" + .author.login + ":** " + .body] | join("\n\n"))
+        ')"
+        # Append any extra instructions
+        if [[ $# -gt 0 ]]; then
+            TASK="$TASK"$'\n\nAdditional instructions: '"$*"
+        fi
+    else
+        TASK="$*"
+    fi
+
+    echo "=== Shipyard Architect ==="
+    echo "Task: $TASK"
+    echo "========================="
+    echo ""
+
+    claude -p "$TASK" \
+        --system-prompt "$SYSTEM_PROMPT" \
+        --disallowedTools "$DENIED_TOOLS"
+else
+    # Interactive mode
+    echo "=== Shipyard Architect (interactive) ==="
+    echo "I plan, delegate, and review. I never write code."
+    echo "========================================="
+    echo ""
+
+    claude \
+        --system-prompt "$SYSTEM_PROMPT" \
+        --disallowedTools "$DENIED_TOOLS"
+fi

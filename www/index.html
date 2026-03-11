@@ -223,6 +223,47 @@ header {
 .typing span:nth-child(2) { animation-delay: 0.18s; }
 .typing span:nth-child(3) { animation-delay: 0.36s; }
 
+.live-tools {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.live-tool {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text2);
+  padding: 6px 10px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(121, 139, 172, 0.1);
+  animation: rise 0.18s ease-out;
+}
+.live-tool-icon {
+  flex-shrink: 0;
+}
+.live-tool-name {
+  font-weight: 600;
+  color: var(--text);
+}
+.live-tool .spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--text3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+.live-tool-done .spinner { display: none; }
+.live-tool-done {
+  opacity: 0.6;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
 .composer {
   position: fixed;
   left: 0;
@@ -1018,6 +1059,11 @@ let liveTaskId = null;
 let liveOffset = 0;
 let liveInterval = null;
 
+// WebSocket state
+let ws = null;
+let wsReady = false;
+let brainActive = false; // true while brain loop is running
+
 const messagesEl = document.getElementById("messages");
 const chatShellEl = document.getElementById("chat-shell");
 const inputEl = document.getElementById("chat-input");
@@ -1025,6 +1071,7 @@ const sendBtnEl = document.getElementById("send-btn");
 
 async function init() {
   bindInput();
+  connectWebSocket();
   await loadProjects();
   if (!projects.length) {
     document.getElementById("setup").classList.remove("hidden");
@@ -1035,6 +1082,145 @@ async function init() {
   document.getElementById("setup").classList.add("hidden");
   await refreshWorkspace();
   setInterval(refreshSidebarData, 5000);
+}
+
+function connectWebSocket() {
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const url = `${protocol}//${location.host}/ws`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => { wsReady = true; };
+  ws.onclose = () => {
+    wsReady = false;
+    // Reconnect after 2s
+    setTimeout(connectWebSocket, 2000);
+  };
+  ws.onerror = () => { wsReady = false; };
+
+  ws.onmessage = (event) => {
+    let data;
+    try { data = JSON.parse(event.data); } catch { return; }
+    handleBrainEvent(data);
+  };
+}
+
+function handleBrainEvent(data) {
+  switch (data.type) {
+    case "connected":
+      break;
+
+    case "thinking": {
+      showTyping();
+      // Show "Thinking..." in live tools area
+      ensureLiveToolsContainer();
+      break;
+    }
+
+    case "tool_start": {
+      hideTyping();
+      ensureLiveToolsContainer();
+      const container = document.getElementById("live-tools");
+      if (container) {
+        const icon = actionIcon(data.tool);
+        const el = document.createElement("div");
+        el.className = "live-tool";
+        el.id = `live-tool-${data.tool}-${Date.now()}`;
+        el.dataset.tool = data.tool;
+        el.innerHTML = `<span class="live-tool-icon">${icon}</span><span class="live-tool-name">${escHtml(toolLabel(data.tool, data.args))}</span><div class="spinner"></div>`;
+        container.appendChild(el);
+        scrollToBottom(true);
+      }
+      break;
+    }
+
+    case "tool_end": {
+      // Mark the last matching tool as done
+      const container = document.getElementById("live-tools");
+      if (container) {
+        const tools = container.querySelectorAll(`.live-tool[data-tool="${data.tool}"]:not(.live-tool-done)`);
+        if (tools.length > 0) {
+          tools[tools.length - 1].classList.add("live-tool-done");
+        }
+      }
+      break;
+    }
+
+    case "reply": {
+      hideTyping();
+      break;
+    }
+
+    case "chat_complete": {
+      hideTyping();
+      removeLiveTools();
+      brainActive = false;
+      isSending = false;
+      sendBtnEl.disabled = false;
+
+      chatHistory.push({
+        role: "assistant",
+        content: data.reply || "Done.",
+        actions: data.actions || [],
+        timestamp: new Date().toISOString(),
+      });
+      renderChat();
+      refreshSidebarData();
+      break;
+    }
+
+    case "done": {
+      // Final cleanup if chat_complete hasn't arrived yet
+      break;
+    }
+
+    case "error": {
+      hideTyping();
+      removeLiveTools();
+      brainActive = false;
+      isSending = false;
+      sendBtnEl.disabled = false;
+
+      chatHistory.push({
+        role: "assistant",
+        content: data.message || "Something went wrong.",
+        actions: null,
+        timestamp: new Date().toISOString(),
+      });
+      renderChat();
+      break;
+    }
+  }
+}
+
+function toolLabel(tool, args) {
+  switch (tool) {
+    case "dispatch_task": return `Dispatching: ${(args && args.title) || "task"}`;
+    case "run_recon": {
+      const n = args && args.issue_number;
+      return n ? `Recon #${n}` : "Running recon";
+    }
+    case "check_status": return "Checking status";
+    case "query_knowledge": return "Querying knowledge";
+    case "list_projects": return "Listing projects";
+    case "kill_task": return `Killing task ${(args && args.task_id) || ""}`;
+    default: return tool;
+  }
+}
+
+function ensureLiveToolsContainer() {
+  if (document.getElementById("live-tools")) return;
+  messagesEl.insertAdjacentHTML("beforeend", `
+    <div id="live-tools-row" class="msg msg-assistant">
+      <div class="bubble" style="padding-bottom:8px;">
+        <div id="live-tools" class="live-tools"></div>
+      </div>
+    </div>
+  `);
+  scrollToBottom(true);
+}
+
+function removeLiveTools() {
+  document.getElementById("live-tools-row")?.remove();
 }
 
 function bindInput() {
@@ -1179,10 +1365,13 @@ function renderActionCard(action) {
 
 function actionIcon(kind) {
   switch ((kind || "").toLowerCase()) {
-    case "dispatch": return "🚀";
-    case "recon": return "🔍";
-    case "knowledge": return "🧠";
-    case "status": return "📊";
+    case "dispatch": case "dispatch_task": return "🚀";
+    case "recon": case "run_recon": return "🔍";
+    case "knowledge": case "query_knowledge": return "🧠";
+    case "status": case "check_status": return "📊";
+    case "list_projects": return "📁";
+    case "kill_task": return "💀";
+    case "steering": return "🔄";
     default: return "⚙️";
   }
 }
@@ -1208,7 +1397,9 @@ function hideTyping() {
 async function sendMessage(event) {
   if (event) event.preventDefault();
   const text = inputEl.value.trim();
-  if (!text || isSending) return;
+  if (!text) return;
+  // Allow sending while brain is active (becomes steering)
+  if (isSending && !brainActive) return;
   await sendChatText(text);
 }
 
@@ -1219,10 +1410,25 @@ async function sendChatText(text) {
     return;
   }
 
-  isSending = true;
-  sendBtnEl.disabled = true;
   inputEl.value = "";
   autoGrowInput();
+
+  // If the brain is already running, send as a steering message
+  if (brainActive && wsReady) {
+    chatHistory.push({
+      role: "user",
+      content: text,
+      actions: null,
+      timestamp: new Date().toISOString(),
+    });
+    renderChat();
+    ws.send(JSON.stringify({ type: "steer", message: text }));
+    return;
+  }
+
+  isSending = true;
+  brainActive = true;
+  sendBtnEl.disabled = false; // keep enabled for steering
 
   chatHistory.push({
     role: "user",
@@ -1231,42 +1437,54 @@ async function sendChatText(text) {
     timestamp: new Date().toISOString(),
   });
   renderChat();
-  showTyping();
 
-  try {
-    const response = await fetch(`${API}/api/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        message: text,
-        project_id: project.id,
-      }),
-    });
+  // Prefer WebSocket, fall back to HTTP
+  if (wsReady) {
+    ws.send(JSON.stringify({
+      type: "chat",
+      message: text,
+      project_id: project.id,
+    }));
+    // Response will come via handleBrainEvent
+  } else {
+    // HTTP fallback
+    showTyping();
+    try {
+      const response = await fetch(`${API}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          message: text,
+          project_id: project.id,
+        }),
+      });
 
-    hideTyping();
-    if (!response.ok) throw new Error("request failed");
-    const data = await response.json();
-    chatHistory.push({
-      role: "assistant",
-      content: data.reply || "Done.",
-      actions: data.actions || [],
-      timestamp: new Date().toISOString(),
-    });
-    renderChat();
-    await refreshSidebarData();
-  } catch (error) {
-    hideTyping();
-    chatHistory.push({
-      role: "assistant",
-      content: "I hit an error sending that. Try again.",
-      actions: null,
-      timestamp: new Date().toISOString(),
-    });
-    renderChat();
-  } finally {
-    isSending = false;
-    sendBtnEl.disabled = false;
-    inputEl.focus();
+      hideTyping();
+      if (!response.ok) throw new Error("request failed");
+      const data = await response.json();
+      chatHistory.push({
+        role: "assistant",
+        content: data.reply || "Done.",
+        actions: data.actions || [],
+        timestamp: new Date().toISOString(),
+      });
+      renderChat();
+      await refreshSidebarData();
+    } catch (error) {
+      hideTyping();
+      chatHistory.push({
+        role: "assistant",
+        content: "I hit an error sending that. Try again.",
+        actions: null,
+        timestamp: new Date().toISOString(),
+      });
+      renderChat();
+    } finally {
+      isSending = false;
+      brainActive = false;
+      sendBtnEl.disabled = false;
+      inputEl.focus();
+    }
   }
 }
 
